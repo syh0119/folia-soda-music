@@ -450,7 +450,7 @@ async function trackV2(trackId) {
     const gi = await reqJson(tp.url_player_info);
     items = gi.Result.Data.PlayInfoList.map(p => ({ quality: p.Quality, main_url: p.MainPlayUrl, spade_a: p.PlayAuth }));
   }
-  return { track: tr, lyric: (j.lyric || {}).content || '', items };
+  return { track: tr, lyric: (j.lyric || {}).content || '', translations: (j.lyric || {}).translations || null, items };
 }
 
 /**
@@ -513,7 +513,7 @@ async function ensureAudio(trackId) {
   const hit = fs.existsSync(metaFile) ? JSON.parse(fs.readFileSync(metaFile, 'utf8')) : null;
   if (hit && fs.existsSync(path.join(CACHE_DIR, hit.file))) return hit;
 
-  const { track, lyric, items } = await trackV2(trackId);
+  const { track, lyric, translations, items } = await trackV2(trackId);
   const pick = pickItem(items);
   const key = DEVN.decodeSpade(pick.spade_a);
   let coverBuf = null;
@@ -534,6 +534,7 @@ async function ensureAudio(trackId) {
     artistIds: (track.artists || []).map(a => String(a.id)),
     album: (track.album || {}).name || '', albumId: String((track.album || {}).id || ''),
     cover: rawCoverOf(track), lyric,
+    translations: translations || null,
     duration: track.duration || 0,
   };
   fs.writeFileSync(metaFile, JSON.stringify(meta));
@@ -994,12 +995,30 @@ const ROUTES = {
     const m = await ensureAudio(q.id);
     const s = krcToStructured(m.lyric);
     const sub = s.line.length ? s.line : openSubsonicLrc(m.lyric);
-    return { lyricsList: { structuredLyrics: [{
+    const structuredLyrics = [{
       displayArtist: (m.artists || []).join(' / '), displayTitle: m.name, lang: 'und', synced: true, kind: 'main',
       line: sub,
       // cueLine = 逐字时间轴。没有它 Folia 会退回行级，表现就是「歌词在、动画没了」。
       ...(s.cueLine.length ? { cueLine: s.cueLine } : {}),
-    }] } };
+    }];
+    // 翻译：j.lyric.translations.cn（LRC 行级，如 [00:00.00]接通电源线…）。
+    // 有翻译的歌才有 translations 字段；老缓存没有时实时补一次 track_v2 并写回 meta。
+    let trs = m.translations;
+    if (trs === undefined) {
+      try { trs = (await trackV2(m.id)).translations; } catch (e) { trs = null; }
+      if (trs) { try { fs.writeFileSync(path.join(CACHE_DIR, m.id + '.json'), JSON.stringify({ ...m, translations: trs })); } catch (e) { } }
+    }
+    const cn = trs && trs.cn;
+    if (cn) {
+      const tl = krcToStructured(cn);                       // 翻译是 LRC 行级，同一个解析器能吃
+      const tline = tl.line.length ? tl.line : openSubsonicLrc(cn);
+      if (tline.length) structuredLyrics.push({
+        displayArtist: (m.artists || []).join(' / '), displayTitle: m.name,
+        lang: 'cn', synced: true, kind: 'translation', format: 'LINE_SYNCED', offset: 0,
+        line: tline,
+      });
+    }
+    return { lyricsList: { structuredLyrics } };
   },
   getCoverArt: async (q, res) => {
     const id = q.id;
