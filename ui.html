@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>汽水音乐 · Folia 音源设置</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --fg:#e8eaf0; --dim:#9aa3b2; --accent:#ff4d6a; --ok:#3ecf8e; --warn:#f2b544; --err:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:920px;margin:0 auto;padding:28px 20px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:22px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 14px;color:var(--dim);font-weight:600;letter-spacing:.4px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .kv{display:grid;grid-template-columns:120px 1fr;gap:6px 12px;font-size:13px}
+  .kv b{color:var(--dim);font-weight:400}
+  code{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-family:Consolas,monospace;font-size:12.5px}
+  button{background:var(--accent);color:#fff;border:0;border-radius:9px;padding:9px 16px;font-size:13.5px;cursor:pointer;font-weight:500}
+  button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;border:1px solid}
+  .badge.ok{color:var(--ok);border-color:rgba(62,207,142,.4);background:rgba(62,207,142,.1)}
+  .badge.no{color:var(--err);border-color:rgba(255,107,107,.4);background:rgba(255,107,107,.1)}
+  #log{background:#0b0d11;border:1px solid var(--line);border-radius:9px;padding:12px;height:200px;overflow:auto;
+       font:12px/1.65 Consolas,monospace;color:#b9c2d0;white-space:pre-wrap}
+  .steps{counter-reset:s;padding-left:0;list-style:none;margin:0}
+  .steps li{counter-increment:s;position:relative;padding-left:30px;margin-bottom:9px;font-size:13.5px;color:#cfd6e2}
+  .steps li:before{content:counter(s);position:absolute;left:0;top:1px;width:20px;height:20px;border-radius:50%;
+    background:var(--panel2);border:1px solid var(--line);color:var(--dim);font-size:11.5px;display:grid;place-items:center}
+  .hint{color:var(--dim);font-size:12.5px;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>汽水音乐 → Folia 音源</h1>
+  <div class="sub">本地 OpenSubsonic 服务端 · Folia 里当作「Navidrome」接入</div>
+
+  <div class="card">
+    <h2>状态</h2>
+    <div class="kv">
+      <b>服务</b><span id="s-server">—</span>
+      <b>设备身份</b><span id="s-device">—</span>
+      <b>登录态</b><span id="s-login">—</span>
+      <b>曲库</b><span id="s-catalog">—</span>
+      <b>目录刷新于</b><span id="s-loaded">—</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>登录态</h2>
+    <div class="row">
+      <button id="btn-sync">从本机汽水客户端同步登录态</button>
+      <button class="ghost" id="btn-catalog">立即刷新曲库目录</button>
+    </div>
+    <div class="hint">
+      需要本机安装并<b>登录过</b>汽水音乐 PC 客户端，且同步时<b>客户端已完全退出</b>（否则 Cookies 库被占用）。<br>
+      换机器使用：装好汽水客户端并登录 → 运行本服务 → 点上面的按钮即可。登录态会缓存到 <code>_session.txt</code>。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>在 Folia 里接入</h2>
+    <ol class="steps">
+      <li>打开 Folia → <code>设置</code> → 音源/资料库 → <b>Navidrome</b></li>
+      <li>服务器地址填 <code id="s-url">http://127.0.0.1:4533</code></li>
+      <li>用户名 <code id="s-user">soda</code>　密码 <code id="s-pass">soda</code></li>
+      <li>保存后首页会出现 Navidrome 页签，歌单在 <b>Playlists</b> 区域</li>
+      <li>歌单里四条来源：<b>① 启动播放队列</b> / <b>我喜欢的音乐</b> / <b>我的歌单</b> / <b>④ 推荐流</b></li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>日志</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let lastLog = 0;
+
+function setLog(lines){
+  const el = $('log');
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  el.textContent = lines.join('\n');
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+async function api(path, opt){
+  const r = await fetch(path, opt);
+  return r.json();
+}
+
+async function tick(){
+  try{
+    const s = await api('/api/status');
+    $('s-server').innerHTML = '<span class="badge ok">运行中</span> 端口 ' + s.port;
+    $('s-device').textContent = s.device ? s.device : '未注册';
+    $('s-login').innerHTML = s.loggedIn
+      ? '<span class="badge ok">已就绪</span> ' + (s.sessionHint || '')
+      : '<span class="badge no">未获取</span> 点下面按钮同步';
+    $('s-catalog').textContent = s.catalog.tracks + ' 曲 / ' + s.catalog.albums + ' 专辑 / ' +
+      s.catalog.artists + ' 歌手 / ' + s.catalog.playlists + ' 歌单';
+    $('s-loaded').textContent = s.loadedAt ? new Date(s.loadedAt).toLocaleString('zh-CN') : '尚未刷新';
+    $('s-url').textContent = 'http://' + (s.host || '127.0.0.1') + ':' + s.port;
+    $('s-user').textContent = s.user;
+    setLog(s.log || []);
+  }catch(e){
+    $('s-server').innerHTML = '<span class="badge no">连接失败</span>';
+  }finally{
+    setTimeout(tick, 2000);
+  }
+}
+
+$('btn-sync').onclick = async () => {
+  const b = $('btn-sync'); b.disabled = true; b.textContent = '同步中…';
+  try{
+    const r = await api('/api/refresh_session', { method:'POST' });
+    alert(r.ok ? ('同步成功：' + (r.hint || '')) : ('同步失败：' + r.error));
+  }catch(e){ alert('同步失败：' + e.message); }
+  b.disabled = false; b.textContent = '从本机汽水客户端同步登录态';
+  tick();
+};
+
+$('btn-catalog').onclick = async () => {
+  const b = $('btn-catalog'); b.disabled = true; b.textContent = '刷新中…';
+  try{
+    const r = await api('/api/refresh_catalog', { method:'POST' });
+    alert(r.ok ? '已刷新' : ('失败：' + r.error));
+  }catch(e){ alert('失败：' + e.message); }
+  b.disabled = false; b.textContent = '立即刷新曲库目录';
+  tick();
+};
+
+tick();
+</script>
+</body>
+</html>

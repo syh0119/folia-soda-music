@@ -1,78 +1,191 @@
-# 汽水音乐 · Folia 模组
+/**
+ * 汽水音乐 · 模组 main（Node 侧）
+ * =============================================================================
+ * 把原本要单独跑的 folia-soda 服务端**内嵌进模组**：
+ *   · activate 时在 Folia 主进程里起一个本机 HTTP 服务（默认 127.0.0.1:4533）
+ *   · Folia 的 Navidrome 通道照旧连它 —— 所以 NAVI 页签的配置完全不用改
+ *   · 禁用 / 重载 / 退出时经 api.lifecycle.onDeactivate 关掉
+ *
+ * ⚠️ 数据目录固定在 %APPDATA%\<AppData>\luna_export\soda，**绝不能落在模组目录里**：
+ * Folia 的模组授权绑定「模组目录的内容摘要」，往里面写一个字节都会摘要失配、
+ * 模组被撤销授权并保持禁用。所以 server.cjs 的 start({ dataDir }) 必须传。
+ *
+ * 原生模块（bdms.node / device.node / metasecml.dll）**不随模组分发**，
+ * 首次运行时从用户自己的汽水音乐客户端目录探测（见 server.cjs 的 resolveNativeDir）。
+ */
+'use strict';
 
-把**本机汽水音乐客户端**接进 Folia 当在线音源。模组自带音源服务（跑在模组 `main` 里，默认 `127.0.0.1:4533`），装一个模组就够，不需要另跑任何程序。
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
-## 前置条件（唯一一条）
+const server = require('./server.cjs');
 
-**汽水音乐 PC 客户端，装好并登录过至少一次。**
+const dataRoot = path.join(
+  process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
+  'luna_export',
+  'soda',
+);
 
-模组要用客户端里的两样东西，两者都**不随模组分发**：
+module.exports = function activate(api) {
+  let handle = null;
+  let lastError = null;
+  let starting = false;
 
-- **签名模块**（`bdms.node` / `device.node` / `metasecml.dll`）—— 从客户端安装目录自动探测
-- **登录态** —— 从客户端的 Chromium Cookies 库解出来（DPAPI + AES-GCM）
+  const safe = (fn, fallback) => { try { return fn(); } catch (e) { return fallback; } };
 
-探测顺序：先读客户端自己的启动日志（`%APPDATA%\SodaMusic\launch_info\launch_log.json`），读不到再查注册表卸载项。都不行时，用环境变量 `SODA_NATIVE_DIR` 直接指向 `...\resources\app.asar.unpacked`。
+  async function boot() {
+    if (starting) return;
+    starting = true;
+    try {
+      handle = await server.start({ dataDir: dataRoot });
+      lastError = null;
+      api.log.info('[汽水] 音源服务已就绪 → http://127.0.0.1:' + handle.port);
+    } catch (e) {
+      lastError = (e && e.message) || String(e);
+      handle = null;
+      api.log.error('[汽水] 音源服务启动失败: ' + lastError);
+    } finally {
+      starting = false;
+    }
+  }
 
-## 安装
+  api.rpc.handle('status', async () => ({
+    running: !!handle,
+    port: handle ? handle.port : null,
+    user: handle ? handle.user : null,
+    pass: handle ? handle.pass : null,
+    dataDir: dataRoot,
+    error: lastError,
+    nativeDir: safe(() => server.resolveNativeDir(), null),
+    clientDirs: safe(() => server.clientInstallDirs(), []),
+    log: handle ? handle.log().slice(-40) : [],
+  }));
 
-1. Folia → **设置 → 实验室** → 打开「模组系统」（默认关闭）
-2. 拖入 `soda-music-*.zip`，或把 `soda-music/` 整个拷到 `%APPDATA%\Folia\mods\`
-3. 模组面板里启用「汽水音乐」→ 原生窗口里**确认一次**
+  api.rpc.handle('restart', async () => {
+    try { if (handle) await handle.stop(); } catch (e) { }
+    handle = null;
+    await boot();
+    return { ok: !!handle, port: handle ? handle.port : null, error: lastError };
+  });
 
-等几秒，它会自己完成：起服务 → 探测原生模块 → 同步登录态 → 拉曲库 → **把书库的 Navidrome 指向本机**。
+  api.rpc.handle('log', async () => (handle ? handle.log().slice(-120) : []));
 
-> NAVI 页签如果没立刻出现，重启一次 Folia（Navidrome 配置是启动时读的）。
+  // 各个 Electron 窗口的状态 —— 用来判断诊断时主窗口有没有被面板/浮层遮挡或失焦
+  // （Chromium 的遮挡检测会在窗口被挡住/失焦时主动降频，那会让测出来的帧率偏低）
+  api.rpc.handle('windows', async () => {
+    try {
+      const { BrowserWindow } = require('electron');
+      return BrowserWindow.getAllWindows().map(w => {
+        let title = '';
+        try { title = w.getTitle(); } catch (e) { }
+        return {
+          title,
+          visible: w.isVisible(),
+          focused: w.isFocused(),
+          minimized: w.isMinimized(),
+          bounds: w.getBounds(),
+        };
+      });
+    } catch (e) {
+      return { error: (e && e.message) || String(e) };
+    }
+  });
 
-## 日常使用：从 NAVI 页签听
+  // GPU 加速状态 —— 滑动掉帧最常见的根因就是它退化成软件渲染
+  api.rpc.handle('gpu', async () => {
+    try {
+      const { app } = require('electron');
+      const s = app.getGPUFeatureStatus() || {};
+      let info = null;
+      try {
+        const { screen } = require('electron');
+        const d = screen.getPrimaryDisplay();
+        info = { hz: Number(d.displayFrequency) || 0, w: (d.size || {}).width, h: (d.size || {}).height, scale: d.scaleFactor };
+      } catch (e) { }
+      let devices = [];
+      try {
+        const gi = await app.getGPUInfo('complete');
+        devices = (gi.gpuDevice || []).map(d => ({
+          active: !!d.active,
+          deviceId: d.deviceId,
+          vendorId: d.vendorId,
+          name: d.deviceString || (d.auxAttributes && d.auxAttributes.glRenderer) || '',
+          renderer: (d.auxAttributes && d.auxAttributes.glRenderer) || '',
+          vendor: (d.auxAttributes && d.auxAttributes.glVendor) || '',
+        }));
+      } catch (e) { }
+      return {
+        display: info,
+        devices,
+        gpu_compositing: s.gpu_compositing,
+        rasterization: s.rasterization,
+        webgl: s.webgl,
+        webgl2: s.webgl2,
+        webgpu: s.webgpu,
+        skia_graphite: s.skia_graphite,
+        canvas_oop_rasterization: s.canvas_oop_rasterization,
+        video_decode: s.video_decode,
+        raw: s,
+      };
+    } catch (e) {
+      return { error: (e && e.message) || String(e) };
+    }
+  });
 
-**NAVI 页签是全功能的** —— 歌单 / 专辑 / 歌手 / 收藏 / 随机、播放（含无损 FLAC）、原生逐字歌词，全都有。它跟在线音源切换器**是两回事**，你把切换器切到网易云，NAVI 照样在、照样能播汽水的歌。
+  // 显示器信息喂给渲染端。
+  // 关键点：**要报「窗口实际所在那块屏」的刷新率**，而不是主屏的 ——
+  // 这台机器上有多个虚拟显示适配器（ToDesk / MuMu / 雷电），窗口可能落在低刷新率的那块上，
+  // 而 Chromium 的 rAF 是跟着「窗口所在屏的 vsync」走的。
+  api.rpc.handle('display', async () => {
+    try {
+      const { screen, BrowserWindow } = require('electron');
+      const primary = screen.getPrimaryDisplay();
+      const displays = screen.getAllDisplays().map(d => ({
+        id: d.id,
+        hz: Number(d.displayFrequency) || 0,
+        w: d.size.width,
+        h: d.size.height,
+        scale: d.scaleFactor,
+        rotation: d.rotation,
+        internal: !!d.internal,
+        primary: !!d.internal && d.id === primary.id,
+        bounds: d.bounds,
+      }));
+      const windows = BrowserWindow.getAllWindows().map(w => {
+        let title = '';
+        try { title = w.getTitle(); } catch (e) { }
+        const b = w.getBounds();
+        let d = null;
+        try { d = screen.getDisplayMatching(b); } catch (e) { }
+        return {
+          title,
+          bounds: b,
+          displayId: d ? d.id : null,
+          hz: d ? (Number(d.displayFrequency) || 0) : 0,
+          size: d ? d.size : null,
+          scale: d ? d.scaleFactor : null,
+        };
+      });
+      return {
+        hz: Number(primary.displayFrequency) || 0,          // 兼容旧字段：主屏
+        width: primary.size.width,
+        height: primary.size.height,
+        scale: primary.scaleFactor,
+        displays,
+        windows,
+      };
+    } catch (e) {
+      return { hz: 0, error: (e && e.message) || String(e) };
+    }
+  });
 
-**推荐用法：不切音源，只用 NAVI。**
+  try { fs.mkdirSync(dataRoot, { recursive: true }); } catch (e) { }
 
-## 进阶
+  boot();
 
-| 想要 | 怎么做 |
-|---|---|
-| 用汽水自己的搜索 | 右下角切换器切到「汽水音乐」 |
-| 无限续播（队列快播完自动续新歌） | 同上，需要模组声明 `folia` 版本范围 |
-| 同步登录态 | 命令「同步汽水客户端登录态」—— **先完全退出汽水客户端** |
-| 刷新曲库目录 | 命令「刷新汽水曲库目录」 |
-| 锁定渲染帧率 | 命令「锁定渲染帧率」（含垂直同步选项） |
-| 诊断滑动卡顿 | 命令「诊断渲染性能」 |
-
-> ⚠️ **切到「汽水音乐」后，UI 上切不回来**：书库的「歌单」页签会被禁用（模组音源的 `userLibrary` 是 false），而音源切换器恰好只挂在那页签里。想回来：**命令面板搜「交还」**，执行「交还在线音源」，然后重启 Folia。模组被禁用时也会自动交还。
-
-## 故障排查
-
-| 现象 | 处理 |
-|---|---|
-| 日志「找不到原生模块」 | 客户端没装过或没跑过。装好启动一次，或设 `SODA_NATIVE_DIR` |
-| 「登录态同步失败」 | 客户端还开着 —— 先完全退出再执行同步 |
-| 歌单 / 搜索为空 | 执行「同步汽水客户端登录态」→「刷新汽水曲库目录」 |
-| 端口 4533 被占用 | 之前单独跑过 folia-soda 服务，先关掉那个窗口 |
-| NAVI 页签不出现 | 重启一次 Folia |
-| 歌词有、逐字动画不亮 | 该曲目的旧缓存没有逐字时间轴：删 `%APPDATA%\Folia\IndexedDB` 后重开 |
-
-## 数据放在哪
-
-`%APPDATA%\luna_export\soda\`（音频缓存、歌词缓存、登录态）。
-
-**刻意不放在模组目录里** —— Folia 的模组授权绑定「模组目录的内容摘要」，往模组目录写一个字节都会摘要失配、模组被撤销授权。
-
-## 架构
-
-```
-Folia 主进程
- ├─ main: index.cjs ──► 内嵌音源服务（OpenSubsonic，127.0.0.1:4533）
- │                        ├─ 原生模块（从汽水客户端探测）
- │                        └─ 曲库聚合 / 取流解密 / KRC 歌词 / 推荐流滚动池
- └─ 渲染进程
-     ├─ client.mjs ──► 音源切换器（omni.providers）+ 歌词优先 + 帧率 + 续播
-     └─ Folia 原生 Navidrome 通道 ──► 连同一个 4533
-```
-
-`main` 与 `client` 通过 `api.rpc.handle` / `folium.rpc.call` 通信（`status` / `restart` / `log` / `display` / `gpu` / `windows`）。
-
-## 免责
-
-本模组把**本机已登录客户端**的播放能力接进 Folia，供个人在自己的设备上使用。不分发任何第三方二进制（原生模块从你自己的客户端现取）。请在遵守相关服务条款的前提下使用。
+  api.lifecycle.onDeactivate(() => {
+    try { if (handle) handle.stop(); } catch (e) { }
+    handle = null;
+  });
+};
