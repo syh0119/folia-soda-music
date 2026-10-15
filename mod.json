@@ -9,6 +9,6 @@
   "main": "index.cjs",
   "client": "client.mjs",
   "permissions": ["net.fetch"],
-  "experimental": ["omni.providers"],
+  "experimental": ["omni.providers", "omni.hooks"],
   "folia": ">=0.7.0 <0.8.0"
 }

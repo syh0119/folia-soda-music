@@ -71,6 +71,20 @@ module.exports = function activate(api) {
 
   api.rpc.handle('log', async () => (handle ? handle.log().slice(-120) : []));
 
+  // 记录「最后播放的歌」（client 的 audioSourceResolved 钩子上报）。
+  // 音源服务的推荐流 loader 读同一路径 —— 实现「从 Folia 上次播到的那首继续」，
+  // 不依赖汽水客户端的 QueueCache（那只有在客户端里听才会更新）。
+  api.rpc.handle('lastPlayed', async (p) => {
+    try {
+      const id = p && p.id;
+      if (!id) return { ok: false };
+      fs.mkdirSync(dataRoot, { recursive: true });
+      fs.writeFileSync(path.join(dataRoot, '_lastplayed.json'),
+        JSON.stringify({ id: String(id), name: (p && p.name) || '', at: Date.now() }));
+      return { ok: true };
+    } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+  });
+
   // 各个 Electron 窗口的状态 —— 用来判断诊断时主窗口有没有被面板/浮层遮挡或失焦
   // （Chromium 的遮挡检测会在窗口被挡住/失焦时主动降频，那会让测出来的帧率偏低）
   api.rpc.handle('windows', async () => {

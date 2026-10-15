@@ -779,6 +779,24 @@ export default function activate(folium) {
   // 先探显示器刷新率（后续提示/命令都会用到），再开始等服务就绪
   probeDisplay().catch(() => { });
 
+  // 记录最后播放的歌：Folia 每解析一首歌的音源就触发 audioSourceResolved（omni.hooks 实验面）。
+  // 通过 rpc 报给服务端落盘 —— 推荐流歌单从「Folia 上次播到的那首」开始，不依赖汽水客户端的 QueueCache。
+  try {
+    const exp = folium.experimental || {};
+    const hooks = exp['omni.hooks'] || exp;
+    if (typeof hooks.on === 'function') {
+      hooks.on('audioSourceResolved', (p) => {
+        const song = p && p.song;
+        const id = song && (song.id ?? song.trackId ?? song.key);
+        if (id == null) return;
+        folium.rpc.call('lastPlayed', {
+          id: String(id).replace(/^track-/, ''),
+          name: song.name || song.title || '',
+        }).catch(() => { });
+      });
+    }
+  } catch (e) { }
+
   // 服务跑在模组 main 里，激活后要一两秒才监听端口 —— 所以带重试
   let tries = 0;
   const probe = () => {

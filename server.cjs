@@ -582,6 +582,17 @@ function readQueueLastKey() {
   return null;
 }
 
+/** 模组自己记的「最后播放的歌」（client 的 audioSourceResolved 钩子上报，main 落盘到数据目录）。
+ *  优先级高于客户端 QueueCache 的 last_played_key —— 那个只有在汽水客户端里听才会更新。 */
+function readLastPlayed() {
+  try {
+    const f = path.join(ROOT, '_lastplayed.json');
+    if (!fs.existsSync(f)) return null;
+    const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+    return j && j.id ? String(j.id) : null;
+  } catch (e) { return null; }
+}
+
 function normTrack(raw) {
   return {
     id: String(raw.id), name: raw.name,
@@ -737,9 +748,9 @@ const VIRTUAL = [
       const feed = await fetchFeedCached();
       const seen = new Set(local.map(t => String(t.id)));
       const rest = feed.filter(t => !seen.has(String(t.id)));
-      // 从上次播放到的那首开始：客户端 QueueCache 记了 last_played_key，
-      // 把它转成列表开头，这样打开歌单点第一首就是接着上次听。
-      const lastId = readQueueLastKey();
+      // 从「上次播放到的那首」开始：优先用 Folia 自己记的位置（audioSourceResolved 钩子上报），
+      // 没有再退回客户端 QueueCache 的 last_played_key。
+      const lastId = readLastPlayed() || readQueueLastKey();
       const idx = lastId ? local.findIndex(t => String(t.id) === lastId) : -1;
       const ordered = idx >= 0 ? local.slice(idx).concat(local.slice(0, idx)) : local;
       return ordered.concat(rest);
