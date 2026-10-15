@@ -763,6 +763,17 @@ async function refreshCatalog(force) {
       try { p.tracks = await fetchPlaylistTracks(p.srcId); p.tracks.forEach(catalogAdd); p.count = p.tracks.length; }
       catch (e) { log('歌单曲目失败 ' + p.name + ': ' + e.message); }
     }
+    // 没有封面的在线歌单：拉一次曲目，随机取一首带封面的歌当歌单封面。
+    // Folia 侧 coverArt 为空会画占位图标，一片灰很难看。拉到的曲目顺便进目录。
+    for (const p of pls.filter(x => x.srcId && !x.cover)) {
+      try {
+        p.tracks = p.tracks || await fetchPlaylistTracks(p.srcId);
+        p.tracks.forEach(catalogAdd);
+        p.count = p.tracks.length;
+        const withCover = p.tracks.filter(t => t.cover);
+        if (withCover.length) p.cover = withCover[Math.floor(Math.random() * withCover.length)].cover;
+      } catch (e) { log('补封面失败 ' + p.name + ': ' + e.message); }
+    }
     CATALOG.playlists = pls;
     CATALOG.loadedAt = Date.now();
     prewarmFeed();   // 预热推荐流池
