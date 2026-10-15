@@ -614,6 +614,26 @@ async function fetchRecommendedPlaylists(n) {
   return out.slice(0, n || 20);
 }
 
+/** 歌单广场（POST /luna/pc/feed/playlist-square）—— 听歌模式里的推荐歌单格子，items 全是 type=playlist。
+ *  只取前 n 个（默认 10），每次刷新曲库重新拉、整体替换。曲目走通用的 /luna/pc/playlist/detail。 */
+async function fetchPlaylistSquare(n) {
+  const r = await rpcPost('/luna/pc/feed/playlist-square', { count: n || 10, is_first_request: true });
+  const out = [];
+  for (const it of (r.items || [])) {
+    const p = (it.entity && it.entity.playlist) || {};
+    if (!p.id) continue;
+    out.push({
+      id: String(p.id), name: p.title || p.name || '未命名',
+      count: p.count_tracks || p.track_count || 0,
+      cover: (p.url_cover && p.url_cover.uri) ? (() => {
+        const base = ((p.url_cover.urls && p.url_cover.urls[0]) || 'https://p3-luna.douyinpic.com/img/') + p.url_cover.uri;
+        return /~tplv|~crop/.test(base) ? base : base + '~tplv-b829550vbb-crop-center:800:800.jpg';
+      })() : '',
+    });
+  }
+  return out.slice(0, n || 10);
+}
+
 async function fetchPlaylistTracks(pid) {
   const out = [];
   let cursor = '0', page = 0;
@@ -789,6 +809,13 @@ async function refreshCatalog(force) {
       }
       if (rec.length) log('推荐歌单 ' + rec.length + ' 个');
     } catch (e) { log('推荐歌单失败: ' + e.message); }
+    try {
+      const sq = await fetchPlaylistSquare(10);   // 歌单广场：只取 10 个，刷新时整体替换
+      for (const p of sq) {
+        pls.push({ id: 'pl_' + p.id, name: p.name, count: p.count, cover: p.cover, srcId: p.id, tracks: null, square: true });
+      }
+      if (sq.length) log('歌单广场 ' + sq.length + ' 个');
+    } catch (e) { log('歌单广场失败: ' + e.message); }
 
     // 目录 = 队列 + 推荐流 + 我喜欢的音乐/前两个歌单（够首页用）
     for (const p of pls) if (p.tracks) p.tracks.forEach(catalogAdd);
