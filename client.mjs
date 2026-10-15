@@ -207,6 +207,8 @@ export default function activate(folium) {
   const PROVIDER_ID = 'folium.soda-music.soda';   // 宿主 id 规则：folium.<modid>.<providerid>
   const FM_BATCH = 60;                            // 每次续拉多少首
   const FM_REMAIN = 2;                            // 剩几首时触发
+  const QUEUE_MAX = 100;                          // 队列上限：超过就裁掉前面序号靠前的
+  const FM_TICK_MS = 10000;                       // 盯队列的间隔
   let fmTimer = null;
 
   /** 把汽水的推荐流歌曲转成宿主内部的 UnifiedSong（字段照 omniProviders.ts 的 toUnifiedSong） */
@@ -257,10 +259,12 @@ export default function activate(folium) {
       const have = new Set(q.map(x => String(x.id)));
       const songs = (await feedSongs(FM_BATCH)).filter(x => !have.has(String(x.id)));
       if (!songs.length) return;
-      st.setPlayQueue(q.concat(songs));
-      say('无限续播：已续上 ' + songs.length + ' 首');
+      let nq = q.concat(songs);
+      if (nq.length > QUEUE_MAX) nq = nq.slice(nq.length - QUEUE_MAX);   // 超上限：去掉前面序号靠前的
+      st.setPlayQueue(nq);
+      say('无限续播：已续上 ' + songs.length + ' 首（队列 ' + nq.length + ' 首）');
     };
-    fmTimer = setInterval(() => { tick().catch(() => { }); }, 5000);
+    fmTimer = setInterval(() => { tick().catch(() => { }); }, FM_TICK_MS);
     tick().catch(() => { });
   }
 
