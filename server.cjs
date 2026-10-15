@@ -566,33 +566,6 @@ function readQueueCache() {
   return out;
 }
 
-/** 客户端 QueueCache 里记的上次播放到的那首歌（last_played_key，形如 `track-xxx`，剥掉前缀拿 id） */
-function readQueueLastKey() {
-  const p = path.join(APPDATA, 'SodaMusic', 'LunaStorage', 'QueueCache');
-  if (!fs.existsSync(p)) return null;
-  const d = fs.readFileSync(p);
-  if (d.subarray(0, 4).toString() !== 'LUNA') return null;
-  try {
-    const j = JSON.parse(zlib.gunzipSync(d.subarray(4)).toString('utf8'));
-    for (const v of Object.values(j)) {
-      const k = v.last_played_key || v.lastPlayedKey;
-      if (k) return String(k).replace(/^track-/, '');
-    }
-  } catch (e) { }
-  return null;
-}
-
-/** 模组自己记的「最后播放的歌」（client 的 audioSourceResolved 钩子上报，main 落盘到数据目录）。
- *  优先级高于客户端 QueueCache 的 last_played_key —— 那个只有在汽水客户端里听才会更新。 */
-function readLastPlayed() {
-  try {
-    const f = path.join(ROOT, '_lastplayed.json');
-    if (!fs.existsSync(f)) return null;
-    const j = JSON.parse(fs.readFileSync(f, 'utf8'));
-    return j && j.id ? String(j.id) : null;
-  } catch (e) { return null; }
-}
-
 function normTrack(raw) {
   return {
     id: String(raw.id), name: raw.name,
@@ -749,16 +722,8 @@ const VIRTUAL = [
     id: 'v_feed',
     name: '④ 推荐流（在线）',
     load: async () => {
-      const local = readQueueCache();
-      const feed = await fetchFeedCached();
-      const seen = new Set(local.map(t => String(t.id)));
-      const rest = feed.filter(t => !seen.has(String(t.id)));
-      // 从「上次播放到的那首」开始：优先用 Folia 自己记的位置（audioSourceResolved 钩子上报），
-      // 没有再退回客户端 QueueCache 的 last_played_key。
-      const lastId = readLastPlayed() || readQueueLastKey();
-      const idx = lastId ? local.findIndex(t => String(t.id) === lastId) : -1;
-      const ordered = idx >= 0 ? local.slice(idx).concat(local.slice(0, idx)) : local;
-      return ordered.concat(rest);
+      // 只用在线 feed，不混入本地队列（QueueCache 是客户端上次听的旧歌，混进来顺序很怪）；上限 100 首
+      return (await fetchFeedCached()).slice(0, 100);
     },
     live: true,
   },

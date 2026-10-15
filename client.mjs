@@ -305,6 +305,40 @@ export default function activate(folium) {
     },
   });
 
+  folium.registries.commands.register({
+    id: 'endless-status',
+    label: { 'zh-CN': '无限续播状态', en: 'Endless radio status' },
+    description: {
+      'zh-CN': '诊断用：查看监听是否在跑、队列长度、当前播到第几首、还剩几首。',
+      en: 'Diagnostics: watcher state, queue length, current index and remaining count.',
+    },
+    keywords: ['汽水', '续播', '状态', '诊断', 'soda', 'status'],
+    run: async () => {
+      try {
+        const internals = folium.internals;
+        const pb = internals && internals.stores && internals.stores.playback;
+        if (!pb || typeof pb.getState !== 'function') return { message: '拿不到播放 store。' };
+        const st = pb.getState();
+        const q = st.playQueue || [];
+        const cur = st.currentSong;
+        const curId = cur ? String(cur.id ?? (cur.sourceRef && cur.sourceRef.mediaId) ?? '') : '';
+        const ci = curId ? q.findIndex(x => String(x.id) === curId) : -1;
+        const remain = ci >= 0 ? q.length - ci - 1 : q.length;
+        const lines = [
+          '监听：' + (fmTimer ? '运行中' : '未开启'),
+          '队列长度：' + q.length,
+          '当前歌曲：' + (cur ? (cur.name || curId) : '(无)'),
+          '当前序号：' + (ci >= 0 ? ci + ' / ' + (q.length - 1) : '未在队列中匹配到（id=' + (curId || '空') + '）'),
+          '剩余：' + remain + ' 首（剩 ' + FM_REMAIN + ' 首触发追加）',
+        ];
+        if (ci === -1 && curId) lines.push('⚠️ 当前歌曲在队列里找不到 —— 这会让续播不触发，把这条发给我');
+        return { message: lines.join('\n') };
+      } catch (e) {
+        return { message: '查询失败：' + e.message };
+      }
+    },
+  });
+
   // ============================================================ 歌词优先（逐字不被在线兜底顶掉）
   // Folia 的歌词优先级是「在线匹配（网易云/酷狗/QQ）> 服务端歌词」——
   // src/components/app/playback/createLyricsSetter.ts 的 getStoredNeteaseLyrics：
@@ -756,24 +790,6 @@ export default function activate(folium) {
 
   // 先探显示器刷新率（后续提示/命令都会用到），再开始等服务就绪
   probeDisplay().catch(() => { });
-
-  // 记录最后播放的歌：Folia 每解析一首歌的音源就触发 audioSourceResolved（omni.hooks 实验面）。
-  // 通过 rpc 报给服务端落盘 —— 推荐流歌单从「Folia 上次播到的那首」开始，不依赖汽水客户端的 QueueCache。
-  try {
-    const exp = folium.experimental || {};
-    const hooks = exp['omni.hooks'] || exp;
-    if (typeof hooks.on === 'function') {
-      hooks.on('audioSourceResolved', (p) => {
-        const song = p && p.song;
-        const id = song && (song.id ?? song.trackId ?? song.key);
-        if (id == null) return;
-        folium.rpc.call('lastPlayed', {
-          id: String(id).replace(/^track-/, ''),
-          name: song.name || song.title || '',
-        }).catch(() => { });
-      });
-    }
-  } catch (e) { }
 
   // 服务跑在模组 main 里，激活后要一两秒才监听端口 —— 所以带重试
   let tries = 0;
