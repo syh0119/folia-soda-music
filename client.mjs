@@ -236,7 +236,7 @@ export default function activate(folium) {
     return j.songs.map(toUnified);
   }
 
-  /** 开启：每 5 秒盯一次队列，快到末尾就追加推荐 */
+  /** 开启：每 10 秒盯一次队列，快到末尾就追加推荐。开关状态持久化到 localStorage，重启自动恢复 */
   function enableEndless() {
     let internals;
     try { internals = folium.internals; }
@@ -246,6 +246,7 @@ export default function activate(folium) {
     }
     const pb = internals && internals.stores && internals.stores.playback;
     if (!pb || typeof pb.getState !== 'function') throw new Error('拿不到播放 store');
+    try { localStorage.setItem('soda_endless_fm', '1'); } catch (e) { }
     if (fmTimer) return;
     const tick = async () => {
       const st = pb.getState();
@@ -268,10 +269,19 @@ export default function activate(folium) {
     tick().catch(() => { });
   }
 
-  /** 关闭：停止盯队列 */
+  /** 关闭：停止盯队列，并清掉持久化的开关 */
   function disableEndless() {
     if (fmTimer) { clearInterval(fmTimer); fmTimer = null; }
+    try { localStorage.removeItem('soda_endless_fm'); } catch (e) { }
   }
+
+  // 恢复持久化的无限续播开关：重启 Folia 后自动开启，不需要手动执行命令。
+  // 延迟 3 秒等 playback store 就绪；tick 本身有容错，store 没就绪就下个周期再试。
+  try {
+    if (localStorage.getItem('soda_endless_fm') === '1') {
+      setTimeout(() => { try { enableEndless(); say('无限续播已自动恢复'); } catch (e) { } }, 3000);
+    }
+  } catch (e) { }
 
   folium.registries.commands.register({
     id: 'endless-on',
