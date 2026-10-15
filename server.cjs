@@ -1044,8 +1044,14 @@ const ROUTES = {
     // 有翻译的歌才有 translations 字段；老缓存没有时实时补一次 track_v2 并写回 meta。
     let trs = m.translations;
     if (trs === undefined) {
-      try { trs = (await trackV2(m.id)).translations; } catch (e) { trs = null; }
-      if (trs) { try { fs.writeFileSync(path.join(CACHE_DIR, m.id + '.json'), JSON.stringify({ ...m, translations: trs })); } catch (e) { } }
+      // 老缓存没有翻译字段：后台补一次，**不阻塞本次响应**（track_v2 要签名+网络 1-2 秒，
+      // await 会让每首老歌都慢一拍）。本次先只给原文；补完写回 meta，下次点开就有翻译。
+      trackV2(m.id).then(r => {
+        if (r && r.translations) {
+          try { fs.writeFileSync(path.join(CACHE_DIR, m.id + '.json'), JSON.stringify({ ...m, translations: r.translations })); } catch (e) { }
+        }
+      }).catch(() => { });
+      trs = null;
     }
     const cn = trs && trs.cn;
     if (cn) {
