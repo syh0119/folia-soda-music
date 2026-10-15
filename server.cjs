@@ -53,16 +53,81 @@ const MIN_ALBUM_TRACKS = parseInt(process.env.MIN_ALBUM_TRACKS || '1', 10);   //
 const MIN_ARTIST_TRACKS = parseInt(process.env.MIN_ARTIST_TRACKS || '1', 10);  // 1 = 不过滤（默认）
 const FEED_PAGES = parseInt(process.env.FEED_PAGES || '12', 10);   // 每页 6 首 → 默认 72 首
 
-const ASSET = __dirname;              // 代码与资源（lib/、ui.html）—— 只读
-/**
- * 数据根（缓存 / 登录态）。独立运行 = 脚本目录；**内嵌进 Folia 模组时必须改到 %APPDATA% 下**：
- * Folia 的模组授权绑定「模组目录内容摘要」，往模组目录里写缓存会让摘要失配、模组被撤销授权。
- */
-let ROOT = ASSET;
+const ASSET = __dirname;              // 代码与资源（lib/、ui.html）—— 只读，永不改变
 const LIB = path.join(ASSET, 'lib');
 const APPDATA = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
-let CACHE_DIR = path.join(ROOT, '_cache');
-let LYRIC_DIR = path.join(ROOT, '_lyric_cache');
+
+/**
+ * 数据目录。独立运行 = 脚本目录；**内嵌进 Folia 模组时绝不能落在模组目录里** ——
+ * Folia 的模组授权绑定「模组目录内容摘要」，往模组目录写文件会让摘要失配、模组被撤销授权。
+ *
+ * Folium 1.5 起宿主提供 api.storage.paths，两个 **getter**（每次读取时目录不存在会先建出来）：
+ *   · paths.data  —— 要保留的文件（登录态、设备标识）
+ *   · paths.cache —— 可重建的缓存（解密音频 / 歌词 / 封面），用户可随时在模组面板清空
+ * 所以这里不缓存路径字符串，一律经 resolvePaths() 现取（维护者审查意见）。
+ */
+let resolvePaths = null;      // () => ({ data, cache })，由 start() 注入
+let FALLBACK_ROOT = ASSET;    // 兜底根：独立运行 / 不支持 paths 的旧宿主（0.7.19）
+
+/** 要保留的数据目录 */
+function dataDir() {
+  const p = resolvePaths ? resolvePaths() : null;
+  const d = (p && p.data) || FALLBACK_ROOT;
+  try { fs.mkdirSync(d, { recursive: true }); } catch (e) { }
+  return d;
+}
+
+/** 可重建的缓存目录（被用户清空后能自建） */
+function cacheDir() {
+  const p = resolvePaths ? resolvePaths() : null;
+  const d = (p && p.cache) || path.join(FALLBACK_ROOT, '_cache');
+  try { fs.mkdirSync(d, { recursive: true }); } catch (e) { }
+  return d;
+}
+
+/** 歌词缓存（放 cache 下的子目录） */
+function lyricDir() {
+  const d = path.join(cacheDir(), 'lyrics');
+  try { fs.mkdirSync(d, { recursive: true }); } catch (e) { }
+  return d;
+}
+
+// ---- 缓存容量 ------------------------------------------------------------
+// 宿主不限制 paths.cache 的大小，而无损音频涨得很快，上限只能模组自己兜。
+// 超过上限就按 mtime 从旧到新删（近似 LRU），直到降到上限的 80%。
+// 带 60 秒节流，不会每写一个文件就遍历一次目录。
+const MAX_CACHE_BYTES = Math.max(64, parseInt(process.env.SODA_MAX_CACHE_MB || '2048', 10)) * 1024 * 1024;
+let lastSweep = 0;
+
+function sweepCache(force) {
+  const now = Date.now();
+  if (!force && now - lastSweep < 60000) return;
+  lastSweep = now;
+  try {
+    const files = [];
+    let total = 0;
+    const walk = (d) => {
+      let entries;
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+      for (const e of entries) {
+        const fp = path.join(d, e.name);
+        if (e.isDirectory()) { walk(fp); continue; }
+        try { const st = fs.statSync(fp); files.push({ fp, size: st.size, mtime: st.mtimeMs }); total += st.size; }
+        catch (err) { }
+      }
+    };
+    walk(cacheDir());
+    if (total <= MAX_CACHE_BYTES) return;
+    log('缓存 ' + (total / 1048576).toFixed(0) + ' MB 超过上限 '
+      + (MAX_CACHE_BYTES / 1048576).toFixed(0) + ' MB，按最旧优先清理');
+    files.sort((a, b) => a.mtime - b.mtime);
+    const target = MAX_CACHE_BYTES * 0.8;
+    for (const f of files) {
+      if (total <= target) break;
+      try { fs.unlinkSync(f.fp); total -= f.size; } catch (e) { }
+    }
+  } catch (e) { }
+}
 
 // ============================================================ 原生模块（延迟加载 + 多路径探测）
 // bdms.node / device.node 都是 N-API 模块（napi_register_module_v1，无 V8/NAN 绑定），
@@ -129,7 +194,7 @@ function resolveNativeDir() {
   if (process.env.SODA_NATIVE_DIR) cands.push(process.env.SODA_NATIVE_DIR);
   cands.push(path.join(ASSET, 'native'));          // 模组自带（可选）
   cands.push(path.join(ASSET, 'lib', 'native'));   // 独立运行的布局
-  cands.push(path.join(ROOT, 'native'));
+  cands.push(path.join(ASSET, 'native'));
   for (const c of cands) if (c && hasNative(c)) return c;
   for (const base of clientInstallDirs()) {
     const d = findNativeIn(base);
@@ -160,14 +225,14 @@ function log(...a) {
   LOG_RING.push(line);
   if (LOG_RING.length > 300) LOG_RING.shift();
 }
-const UI_HTML = (() => { try { return fs.readFileSync(path.join(ROOT, 'ui.html'), 'utf8'); } catch (e) { return '<h1>ui.html 缺失</h1>'; } })();
+const UI_HTML = (() => { try { return fs.readFileSync(path.join(ASSET, 'ui.html'), 'utf8'); } catch (e) { return '<h1>ui.html 缺失</h1>'; } })();
 
 // ============================================================ 设备身份 + 登录态
 let DEV = null;
 let COOKIE = '';
 let sessHint = '';
 
-function deviceFile() { return path.join(APPDATA, 'luna_export', 'device.json'); }
+function deviceFile() { return path.join(dataDir(), 'device.json'); }
 
 /** 初始化原生签名器（必须先做，否则 X-Helios/X-Medusa 为空，track_v2 等接口会返回空响应） */
 function initBdms() {
@@ -255,14 +320,14 @@ function ps(cmd, timeoutMs) {
 
 /** 兜底：读取已提取好的 _pc_cookie.json（由 _pc_cookie.py 用 Python 提取） */
 function trySessionFromJson() {
-  for (const p of [path.join(ROOT, '_pc_cookie.json'), path.join(ROOT, '..', '_pc_cookie.json')]) {
+  for (const p of [path.join(dataDir(), '_pc_cookie.json'), path.join(path.dirname(dataDir()), '_pc_cookie.json')]) {
     try {
       if (!fs.existsSync(p)) continue;
       const j = JSON.parse(fs.readFileSync(p, 'utf8'));
       const cookie = j.cookie || Object.entries(j.cookieMap || {}).map(([k, v]) => k + '=' + v).join('; ');
       if (!cookie) continue;
       COOKIE = cookie;
-      fs.writeFileSync(path.join(ROOT, '_session.txt'), cookie);
+      fs.writeFileSync(path.join(dataDir(), '_session.txt'), cookie);
       sessHint = '来自 _pc_cookie.json · ' + cookie.length + ' 字符';
       log('已从 _pc_cookie.json 载入登录态（' + p + '）');
       return true;
@@ -323,7 +388,7 @@ async function refreshSessionFromClient() {
   for (const r of rows) if (r.host_key === '.qishui.com') ck[r.name] = r.value || dec(r.encrypted_value);
   if (!ck.sessionid) throw new Error('未找到 sessionid（客户端里还没登录？）');
   const cookie = Object.entries(ck).map(([k, v]) => k + '=' + v).join('; ');
-  fs.writeFileSync(path.join(ROOT, '_session.txt'), cookie);
+  fs.writeFileSync(path.join(dataDir(), '_session.txt'), cookie);
   COOKIE = cookie;
   sessHint = 'sessionid ' + String(ck.sessionid).slice(0, 10) + '… 共 ' + Object.keys(ck).length + ' 项';
   log('已从客户端同步登录态 sessionid=' + String(ck.sessionid).slice(0, 10) + '…');
@@ -347,7 +412,7 @@ function sweepTempCookies() {
 }
 
 function loadSession() {
-  const p = path.join(ROOT, '_session.txt');
+  const p = path.join(dataDir(), '_session.txt');
   if (fs.existsSync(p)) { COOKIE = fs.readFileSync(p, 'utf8').trim(); sessHint = COOKIE.length + ' 字符（' + new Date(fs.statSync(p).mtime).toLocaleString('zh-CN') + '）'; }
   return COOKIE;
 }
@@ -459,21 +524,21 @@ async function trackV2(trackId) {
  * 绝不走 ensureAudio —— 那会顺带下载并解密整首歌（无损 25MB，2–5 秒），预取等不起。
  */
 async function fetchLyricOnly(trackId) {
-  const f = path.join(LYRIC_DIR, trackId + '.txt');
+  const f = path.join(lyricDir(), trackId + '.txt');
   if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8');
-  const metaFile = path.join(CACHE_DIR, trackId + '.json');
+  const metaFile = path.join(cacheDir(), trackId + '.json');
   if (fs.existsSync(metaFile)) {
     try {
       const m = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
       if (m && typeof m.lyric === 'string') {
-        fs.mkdirSync(LYRIC_DIR, { recursive: true });
+        fs.mkdirSync(lyricDir(), { recursive: true });
         fs.writeFileSync(f, m.lyric);
         return m.lyric;
       }
     } catch (e) { }
   }
   const { lyric } = await trackV2(trackId);
-  fs.mkdirSync(LYRIC_DIR, { recursive: true });
+  fs.mkdirSync(lyricDir(), { recursive: true });
   fs.writeFileSync(f, lyric || '');
   return lyric || '';
 }
@@ -509,9 +574,9 @@ function rawCoverOf(tr) {
 
 /** 取流 + 解密 + 落盘缓存 */
 async function ensureAudio(trackId) {
-  const metaFile = path.join(CACHE_DIR, trackId + '.json');
+  const metaFile = path.join(cacheDir(), trackId + '.json');
   const hit = fs.existsSync(metaFile) ? JSON.parse(fs.readFileSync(metaFile, 'utf8')) : null;
-  if (hit && fs.existsSync(path.join(CACHE_DIR, hit.file))) return hit;
+  if (hit && fs.existsSync(path.join(cacheDir(), hit.file))) return hit;
 
   const { track, lyric, translations, items } = await trackV2(trackId);
   const pick = pickItem(items);
@@ -527,7 +592,8 @@ async function ensureAudio(trackId) {
     lyric, coverBuf,
   });
   const fname = trackId + r.ext;
-  fs.writeFileSync(path.join(CACHE_DIR, fname), r.data);
+  sweepCache();   // 落盘前兜一下容量上限
+  fs.writeFileSync(path.join(cacheDir(), fname), r.data);
   const meta = {
     id: String(trackId), file: fname, ext: r.ext, kind: r.kind, quality: pick.quality,
     name: track.name, artists: (track.artists || []).map(a => a.name),
@@ -1080,7 +1146,7 @@ const ROUTES = {
       // await 会让每首老歌都慢一拍）。本次先只给原文；补完写回 meta，下次点开就有翻译。
       trackV2(m.id).then(r => {
         if (r && r.translations) {
-          try { fs.writeFileSync(path.join(CACHE_DIR, m.id + '.json'), JSON.stringify({ ...m, translations: r.translations })); } catch (e) { }
+          try { fs.writeFileSync(path.join(cacheDir(), m.id + '.json'), JSON.stringify({ ...m, translations: r.translations })); } catch (e) { }
         }
       }).catch(() => { });
       trs = null;
@@ -1105,7 +1171,7 @@ const ROUTES = {
     // 之前忽略了 size，一律回 800×800，几百张卡片一起渲染时 GPU 会被拖死。
     const size = parseInt(q.size || '0', 10);
     const px = size >= 64 ? Math.min(size, 1200) : 800;
-    const f = path.join(CACHE_DIR, 'cover_' + md5(id + '@' + px) + '.jpg');
+    const f = path.join(cacheDir(), 'cover_' + md5(id + '@' + px) + '.jpg');
     if (fs.existsSync(f)) return sendImage(res, fs.readFileSync(f));
     const t = CATALOG.tracks.get(id) || [...CATALOG.tracks.values()].find(x => x.albumId === id);
     const base = (t && t.cover) || (id.startsWith('http') ? id : '');
@@ -1125,7 +1191,7 @@ const ROUTES = {
   },
   stream: async (q, res, reqObj) => {
     const m = await ensureAudio(q.id);
-    const file = path.join(CACHE_DIR, m.file);
+    const file = path.join(cacheDir(), m.file);
     const stat = fs.statSync(file);
     const type = m.ext === '.flac' ? 'audio/flac' : (m.ext === '.m4a' ? 'audio/mp4' : 'application/octet-stream');
     const range = reqObj.headers.range;
@@ -1421,15 +1487,17 @@ const server = http.createServer(async (rq, rs) => {
  */
 async function start(opts = {}) {
   sweepTempCookies();
-  if (opts.dataDir) {
-    ROOT = path.resolve(opts.dataDir);
-    CACHE_DIR = path.join(ROOT, '_cache');
-    LYRIC_DIR = path.join(ROOT, '_lyric_cache');
+  // 路径：优先用宿主给的 getter（Folium 1.5+）；否则退回 opts.dataDir（独立运行 / 旧宿主）
+  if (opts.resolvePaths) {
+    resolvePaths = opts.resolvePaths;
+  } else if (opts.dataDir) {
+    FALLBACK_ROOT = path.resolve(opts.dataDir);
   }
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  fs.mkdirSync(LYRIC_DIR, { recursive: true });
+  fs.mkdirSync(dataDir(), { recursive: true });
+  fs.mkdirSync(cacheDir(), { recursive: true });
+  fs.mkdirSync(lyricDir(), { recursive: true });
 
-  log('soda-subsonic 启动中 …' + (opts.dataDir ? '（数据目录 ' + ROOT + '）' : ''));
+  log('soda-subsonic 启动中 …（数据 ' + dataDir() + ' / 缓存 ' + cacheDir() + '）');
 
   // 先把服务起起来，UI 立刻可见；设备 / 登录态 / 曲库在后台初始化
   await new Promise((resolve, reject) => {

@@ -6,31 +6,58 @@
  *   · Folia 的 Navidrome 通道照旧连它 —— 所以 NAVI 页签的配置完全不用改
  *   · 禁用 / 重载 / 退出时经 api.lifecycle.onDeactivate 关掉
  *
- * ⚠️ 数据目录固定在 %APPDATA%\<AppData>\luna_export\soda，**绝不能落在模组目录里**：
+ * 文件目录：**绝不能落在模组目录里** ——
  * Folia 的模组授权绑定「模组目录的内容摘要」，往里面写一个字节都会摘要失配、
- * 模组被撤销授权并保持禁用。所以 server.cjs 的 start({ dataDir }) 必须传。
+ * 模组被撤销授权并保持禁用。
+ *
+ * Folium 1.5 起用宿主给的 api.storage.paths（两个 getter，每次读取时目录不存在会先建出来）：
+ *   · paths.data  —— 要保留的文件（登录态、设备标识）
+ *   · paths.cache —— 可重建的缓存（解密音频 / 歌词 / 封面），用户可随时在模组面板清空
+ * 不支持 paths 的旧宿主（0.7.19 / Folium 1.4）退回 %APPDATA%\luna_export\soda。
+ * 路径一律按需现取（宿主是 getter，且缓存随时可能被清），不在启动时存字符串。
  *
  * 原生模块（bdms.node / device.node / metasecml.dll）**不随模组分发**，
  * 首次运行时从用户自己的汽水音乐客户端目录探测（见 server.cjs 的 resolveNativeDir）。
  */
 'use strict';
 
-const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
 const server = require('./server.cjs');
 
-const dataRoot = path.join(
-  process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
-  'luna_export',
-  'soda',
-);
+/** 旧布局兜底：不支持 api.storage.paths 的宿主 */
+function legacyPaths() {
+  const root = path.join(
+    process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
+    'luna_export',
+    'soda',
+  );
+  return { data: root, cache: path.join(root, '_cache') };
+}
+
+/**
+ * 返回一个「每次调用都现取路径」的函数交给 server.start。
+ * 宿主是 getter：目录不存在时会先建出来；用户清空缓存后也照常工作。
+ */
+function makeResolvePaths(api) {
+  const st = api && api.storage;
+  const supported = !!(st && st.paths);   // 等价于 'paths' in api.storage
+  return () => {
+    if (supported) {
+      try { return { data: st.paths.data, cache: st.paths.cache }; }
+      catch (e) { /* 权限缺失等 → 退回旧布局，别让服务起不来 */ }
+    }
+    return legacyPaths();
+  };
+}
 
 module.exports = function activate(api) {
   let handle = null;
   let lastError = null;
   let starting = false;
+
+  const resolvePaths = makeResolvePaths(api);
 
   const safe = (fn, fallback) => { try { return fn(); } catch (e) { return fallback; } };
 
@@ -38,7 +65,7 @@ module.exports = function activate(api) {
     if (starting) return;
     starting = true;
     try {
-      handle = await server.start({ dataDir: dataRoot });
+      handle = await server.start({ resolvePaths });
       lastError = null;
       api.log.info('[汽水] 音源服务已就绪 → http://127.0.0.1:' + handle.port);
     } catch (e) {

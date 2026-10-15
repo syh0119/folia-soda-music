@@ -8,7 +8,7 @@
   "preview": "preview.jpg",
   "main": "index.cjs",
   "client": "client.mjs",
-  "permissions": ["net.fetch"],
+  "permissions": ["net.fetch", "filesystem.data"],
   "experimental": ["omni.providers", "omni.hooks"],
   "folia": ">=0.7.0 <0.8.0"
 }
