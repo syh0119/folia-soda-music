@@ -929,14 +929,18 @@ const ROUTES = {
   getGenres: async () => ({ genres: { genre: [] } }),
   getScanStatus: async () => ({ scanStatus: { scanning: false, count: CATALOG.tracks.size } }),
 
-  getPlaylists: async () => {
+  getPlaylists: async (q) => {
     await refreshCatalog();
+    // 支持 offset/size 翻页（无限滚动）：不传 offset 时返回全部
+    const offset = Math.max(0, parseInt(q.offset || '0', 10) || 0);
+    const size = Math.max(1, parseInt(q.size || '0', 10) || 500);
     // 列表只需要元信息：去掉 entry，避免把整张歌单塞进列表响应
-    return { playlists: { playlist: CATALOG.playlists.map(p => {
+    const all = CATALOG.playlists.map(p => {
       const o = playlistOf(p);
       delete o.entry;
       return o;
-    }) } };
+    });
+    return { playlists: { playlist: all.slice(offset, offset + size) } };
   },
   getPlaylist: async (q) => {
     await refreshCatalog();
