@@ -590,6 +590,26 @@ async function fetchMyPlaylists() {
   }));
 }
 
+/** 推荐页的歌单广场（POST /luna/pc/feed/playlist-square）—— items 全是 type=playlist 的推荐歌单。
+ *  曲目走通用的 /luna/pc/playlist/detail（和自建歌单同一个入口）。 */
+async function fetchRecommendedPlaylists(n) {
+  const r = await rpcPost('/luna/pc/feed/playlist-square', { count: 20, is_first_request: true });
+  const out = [];
+  for (const it of (r.items || [])) {
+    const p = (it.entity && it.entity.playlist) || {};
+    if (!p.id) continue;
+    out.push({
+      id: String(p.id), name: p.title || p.name || '未命名',
+      count: p.count_tracks || p.track_count || 0,
+      cover: (p.url_cover && p.url_cover.uri) ? (() => {
+        const base = ((p.url_cover.urls && p.url_cover.urls[0]) || 'https://p3-luna.douyinpic.com/img/') + p.url_cover.uri;
+        return /~tplv|~crop/.test(base) ? base : base + '~tplv-b829550vbb-crop-center:800:800.jpg';
+      })() : '',
+    });
+  }
+  return out.slice(0, n || 20);
+}
+
 async function fetchPlaylistTracks(pid) {
   const out = [];
   let cursor = '0', page = 0;
@@ -751,13 +771,20 @@ async function refreshCatalog(force) {
         pls.push({ id: v.id, name: v.name, count: ts.length, cover: (ts[0] && ts[0].cover) || '', virtual: true, tracks: ts });
       } catch (e) { log('来源失败 ' + v.name + ': ' + e.message); }
     }
-    // 在线歌单
+    // 在线歌单：我创建的 + 推荐页的歌单广场（type=playlist，走同一个 playlist/detail 入口）
     try {
       const mine = await fetchMyPlaylists();
       for (const p of mine) {
         pls.push({ id: 'pl_' + p.id, name: p.name, count: p.count, cover: p.cover, srcId: p.id, tracks: null });
       }
     } catch (e) { log('我的歌单失败: ' + e.message); }
+    try {
+      const rec = await fetchRecommendedPlaylists(20);
+      for (const p of rec) {
+        pls.push({ id: 'pl_' + p.id, name: p.name, count: p.count, cover: p.cover, srcId: p.id, tracks: null, rec: true });
+      }
+      if (rec.length) log('推荐歌单 ' + rec.length + ' 个');
+    } catch (e) { log('推荐歌单失败: ' + e.message); }
 
     // 目录 = 队列 + 推荐流 + 我喜欢的音乐/前两个歌单（够首页用）
     for (const p of pls) if (p.tracks) p.tracks.forEach(catalogAdd);
