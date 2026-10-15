@@ -566,6 +566,22 @@ function readQueueCache() {
   return out;
 }
 
+/** 客户端 QueueCache 里记的上次播放到的那首歌（last_played_key，形如 `track-xxx`，剥掉前缀拿 id） */
+function readQueueLastKey() {
+  const p = path.join(APPDATA, 'SodaMusic', 'LunaStorage', 'QueueCache');
+  if (!fs.existsSync(p)) return null;
+  const d = fs.readFileSync(p);
+  if (d.subarray(0, 4).toString() !== 'LUNA') return null;
+  try {
+    const j = JSON.parse(zlib.gunzipSync(d.subarray(4)).toString('utf8'));
+    for (const v of Object.values(j)) {
+      const k = v.last_played_key || v.lastPlayedKey;
+      if (k) return String(k).replace(/^track-/, '');
+    }
+  } catch (e) { }
+  return null;
+}
+
 function normTrack(raw) {
   return {
     id: String(raw.id), name: raw.name,
@@ -720,7 +736,13 @@ const VIRTUAL = [
       const local = readQueueCache();
       const feed = await fetchFeedCached();
       const seen = new Set(local.map(t => String(t.id)));
-      return local.concat(feed.filter(t => !seen.has(String(t.id))));
+      const rest = feed.filter(t => !seen.has(String(t.id)));
+      // 从上次播放到的那首开始：客户端 QueueCache 记了 last_played_key，
+      // 把它转成列表开头，这样打开歌单点第一首就是接着上次听。
+      const lastId = readQueueLastKey();
+      const idx = lastId ? local.findIndex(t => String(t.id) === lastId) : -1;
+      const ordered = idx >= 0 ? local.slice(idx).concat(local.slice(0, idx)) : local;
+      return ordered.concat(rest);
     },
     live: true,
   },
