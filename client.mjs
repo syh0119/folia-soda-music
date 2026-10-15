@@ -196,29 +196,18 @@ export default function activate(folium) {
     },
   });
 
-  // ============================================================ 无限续播（私人 FM）
-  // Folia 的「续拉」机制藏在私人 FM 模式里 —— 队列播到**倒数第二首**时会自动追加新歌：
+  // ============================================================ 无限续播（追队列版）
+  // 第一版用的是 Folia 的私人 FM：接管 omni.getPersonalFm + setIsFmMode(true)。
+  // 续播有了，但 FM 模式会把播放页的「队列」页签换成「电台」面板 —— 用户要看队列列表。
   //
-  //   // src/hooks/usePlaybackQueueController.ts · handleNextTrack
-  //   if (isFmMode && currentIndex >= playQueue.length - 2) {
-  //       const fmSongs = await omni.getPersonalFm();
-  //       const nextQueue = [...playQueue, ...fmSongs];
-  //       setPlayQueue(nextQueue);
-  //       playSong(nextQueue[currentIndex + 1], nextQueue, true, { ... });
-  //   }
-  //
-  // 但模组音源走不到这儿：适配层把 provider 的能力写死成 recommendations:false，
-  // 且**根本不构造** provider.recommendations（registries/omniProviders.ts），
-  // 所以 omni.getPersonalFm 对模组音源永远返回 []。
-  //
-  // 绕法：不碰 provider，直接从 folium.internals 拿宿主对象 ——
-  //   · internals.stores.playback → usePlaybackStore（有 setIsFmMode）
-  //   · internals.omni            → 普通对象字面量、未冻结，换掉 getPersonalFm 即可
-  // 需要 manifest 里的 "folia" 版本范围，否则访问 internals 会抛错（已写: >=0.7.0 <0.8.0）。
+  // 这版改为自己盯播放队列（不开 FM）：
+  //   · 每 5 秒读一次 playback store（playQueue + currentSong）
+  //   · 「当前之后剩 ≤ 2 首」时，把汽水推荐直接追加进 playQueue（去重）
+  // 不碰 omni、不碰 isFmMode，队列页签保持原样。仍然需要 internals（folia 版本范围）。
   const PROVIDER_ID = 'folium.soda-music.soda';   // 宿主 id 规则：folium.<modid>.<providerid>
   const FM_BATCH = 60;                            // 每次续拉多少首
-
-  let fmHijack = null;   // { omni, raw } —— 已接管时留底，便于还原
+  const FM_REMAIN = 2;                            // 剩几首时触发
+  let fmTimer = null;
 
   /** 把汽水的推荐流歌曲转成宿主内部的 UnifiedSong（字段照 omniProviders.ts 的 toUnifiedSong） */
   const toUnified = (s) => {
@@ -245,65 +234,54 @@ export default function activate(folium) {
     return j.songs.map(toUnified);
   }
 
-  /** 接管 omni.getPersonalFm + 打开私人 FM 模式 */
-  function enableEndlessFm() {
+  /** 开启：每 5 秒盯一次队列，快到末尾就追加推荐 */
+  function enableEndless() {
     let internals;
     try { internals = folium.internals; }
     catch (e) {
       throw new Error('这个功能要访问宿主内部接口，需要清单里声明 folia 版本范围（为避免版本绑定，公开发布版已移除该声明）。' +
         '自用的话在 mod.json 里加一行 "folia": ">=0.7.0 <0.8.0" 就能用。');
     }
-    if (!internals) throw new Error('宿主没有暴露 internals');
-    const omni = internals.omni;
-    const pb = internals.stores && internals.stores.playback;
-    if (!omni || typeof omni !== 'object') throw new Error('拿不到 omni');
+    const pb = internals && internals.stores && internals.stores.playback;
     if (!pb || typeof pb.getState !== 'function') throw new Error('拿不到播放 store');
-
-    if (!fmHijack) {
-      const raw = typeof omni.getPersonalFm === 'function' ? omni.getPersonalFm : null;
-      const orig = raw ? raw.bind(omni) : null;
-      omni.getPersonalFm = async (opts) => {
-        // 内置音源（网易云等）自己能给 FM 就先听它的 —— 切走音源时不受影响
-        if (orig) { try { const r = await orig(opts); if (r && r.length) return r; } catch (e) { } }
-        try { return await feedSongs(FM_BATCH); }
-        catch (e) { say('无限续播取歌失败: ' + e.message); return []; }
-      };
-      fmHijack = { omni, raw };
-      say('已接管 omni.getPersonalFm');
-    }
-    pb.getState().setIsFmMode(true);
-    say('私人 FM 模式已开启');
+    if (fmTimer) return;
+    const tick = async () => {
+      const st = pb.getState();
+      const q = st.playQueue || [];
+      if (!q.length) return;
+      const cur = st.currentSong;
+      const curId = cur ? String(cur.id ?? (cur.sourceRef && cur.sourceRef.mediaId) ?? '') : '';
+      const ci = curId ? q.findIndex(x => String(x.id) === curId) : -1;
+      const remain = ci >= 0 ? q.length - ci - 1 : q.length;
+      if (remain > FM_REMAIN) return;
+      const have = new Set(q.map(x => String(x.id)));
+      const songs = (await feedSongs(FM_BATCH)).filter(x => !have.has(String(x.id)));
+      if (!songs.length) return;
+      st.setPlayQueue(q.concat(songs));
+      say('无限续播：已续上 ' + songs.length + ' 首');
+    };
+    fmTimer = setInterval(() => { tick().catch(() => { }); }, 5000);
+    tick().catch(() => { });
   }
 
-  /** 还原 omni.getPersonalFm 并关掉私人 FM 模式 */
-  function disableEndlessFm() {
-    if (fmHijack) {
-      try {
-        if (fmHijack.raw) fmHijack.omni.getPersonalFm = fmHijack.raw;
-        else delete fmHijack.omni.getPersonalFm;
-      } catch (e) { }
-      fmHijack = null;
-    }
-    try {
-      const pb = folium.internals && folium.internals.stores && folium.internals.stores.playback;
-      if (pb && pb.getState) pb.getState().setIsFmMode(false);
-    } catch (e) { }
+  /** 关闭：停止盯队列 */
+  function disableEndless() {
+    if (fmTimer) { clearInterval(fmTimer); fmTimer = null; }
   }
 
   folium.registries.commands.register({
     id: 'endless-on',
-    label: { 'zh-CN': '开启无限续播（私人 FM）', en: 'Enable endless radio' },
+    label: { 'zh-CN': '开启无限续播', en: 'Enable endless radio' },
     description: {
-      'zh-CN': '让队列播到倒数第二首时自动续上一批全新的汽水推荐歌，一直听下去不重复。' +
-        '原理是接管宿主的私人 FM 续拉入口。副作用：播放页的「队列」会变成「电台」面板。' +
-        '开启后任意歌单/专辑都适用；再执行一次「关闭无限续播」可还原。',
-      en: 'Auto-append fresh Soda recommendations when the queue runs low (uses Personal FM).',
+      'zh-CN': '每 5 秒盯一次播放队列，剩 2 首时自动追加一批全新的汽水推荐（60 首、不重复）。' +
+        '不开私人 FM 模式，播放页的「队列」列表保持原样。重启 Folia 后需重新开启。',
+      en: 'Watch the queue every 5s and append fresh Soda recommendations when only 2 songs remain.',
     },
-    keywords: ['汽水', '续播', '无限', '电台', '推荐', 'fm', 'soda', 'endless', 'radio'],
+    keywords: ['汽水', '续播', '无限', '推荐', 'fm', 'soda', 'endless', 'radio'],
     run: async () => {
       try {
-        enableEndlessFm();
-        return { message: '无限续播已开启：队列播到倒数第二首会自动续上汽水推荐流（每次 ' + FM_BATCH + ' 首，不重复）。' };
+        enableEndless();
+        return { message: '无限续播已开启：队列剩 ' + FM_REMAIN + ' 首时自动续上汽水推荐（每次 ' + FM_BATCH + ' 首，不重复）。' };
       } catch (e) {
         const msg = '开启失败：' + e.message;
         say(msg);
@@ -316,14 +294,14 @@ export default function activate(folium) {
     id: 'endless-off',
     label: { 'zh-CN': '关闭无限续播', en: 'Disable endless radio' },
     description: {
-      'zh-CN': '还原宿主的私人 FM 入口，并退出 FM 模式。队列播完即停。',
-      en: 'Restore the host Personal FM entry and leave FM mode.',
+      'zh-CN': '停止盯队列。已追加的歌保留，播完即停。',
+      en: 'Stop watching the queue. Already appended songs remain.',
     },
     keywords: ['汽水', '关闭', '续播', 'fm', 'soda', 'off'],
     run: async () => {
-      disableEndlessFm();
+      disableEndless();
       say('无限续播已关闭');
-      return { message: '无限续播已关闭，私人 FM 模式已退出。' };
+      return { message: '无限续播已关闭。' };
     },
   });
 
