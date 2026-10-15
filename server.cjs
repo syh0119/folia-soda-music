@@ -590,16 +590,20 @@ async function fetchMyPlaylists() {
   }));
 }
 
-/** 推荐页的歌单广场（POST /luna/pc/feed/playlist-square）—— items 全是 type=playlist 的推荐歌单。
- *  曲目走通用的 /luna/pc/playlist/detail（和自建歌单同一个入口）。 */
+/** 首页「推荐」（默认模式）的推荐歌单 —— GET /luna/pc/me/playlist/recommend，
+ *  返回带 daily_playlist_info 的每日推荐歌单。曲目走通用的 /luna/pc/playlist/detail。
+ *  注意：playlist-square 是「听歌模式」的歌单广场，不是首页推荐要的。 */
 async function fetchRecommendedPlaylists(n) {
-  const r = await rpcPost('/luna/pc/feed/playlist-square', { count: 20, is_first_request: true });
+  let r = null;
+  for (const p of ['/luna/pc/me/playlist/recommend', '/luna/me/playlist/recommend']) {
+    try { r = await rpcGet(p, { count: '20' }); if (r && (r.playlists || []).length) break; } catch (e) { r = null; }
+  }
   const out = [];
-  for (const it of (r.items || [])) {
-    const p = (it.entity && it.entity.playlist) || {};
+  for (const p of ((r && r.playlists) || [])) {
     if (!p.id) continue;
     out.push({
-      id: String(p.id), name: p.title || p.name || '未命名',
+      id: String(p.id),
+      name: (p.daily_playlist_info && p.daily_playlist_info.title) || p.title || '每日推荐',
       count: p.count_tracks || p.track_count || 0,
       cover: (p.url_cover && p.url_cover.uri) ? (() => {
         const base = ((p.url_cover.urls && p.url_cover.urls[0]) || 'https://p3-luna.douyinpic.com/img/') + p.url_cover.uri;
