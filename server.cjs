@@ -608,7 +608,12 @@ async function fetchMyPlaylists() {
   return (j.playlists || []).map(p => ({
     id: String(p.id), name: p.title || p.name || '未命名',
     count: p.count_tracks || p.track_count || 0,
-    cover: (p.url_cover && p.url_cover.uri) ? ((p.url_cover.urls && p.url_cover.urls[0]) || 'https://p3-luna.douyinpic.com/img/') + p.url_cover.uri : '',
+    cover: (p.url_cover && p.url_cover.uri) ? (() => {
+      // douyinpic 的封面 URL 必须带模板后缀（~tplv-xxx-crop-center:WxH.jpg）才返回 200，
+      // 裸 URI 是 404 —— 之前歌单封面就是漏了这一步，导致自建歌单在书库里全没封面。
+      const base = ((p.url_cover.urls && p.url_cover.urls[0]) || 'https://p3-luna.douyinpic.com/img/') + p.url_cover.uri;
+      return /~tplv|~crop/.test(base) ? base : base + '~tplv-b829550vbb-crop-center:800:800.jpg';
+    })() : '',
   }));
 }
 
