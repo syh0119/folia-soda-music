@@ -2,7 +2,7 @@
   "folium": 1,
   "id": "soda-music",
   "name": "汽水音乐",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "syh0119",
   "description": "把本机汽水音乐接入为在线音源：搜索、播放（含无损 FLAC）、原生逐字歌词、无限续播。模组自带音源服务（跑在 main 里，默认端口 4533），无需另装其它程序。需要先安装并登录汽水音乐 PC 客户端。",
   "preview": "preview.jpg",
