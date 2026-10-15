@@ -763,27 +763,15 @@ async function refreshCatalog(force) {
       try { p.tracks = await fetchPlaylistTracks(p.srcId); p.tracks.forEach(catalogAdd); p.count = p.tracks.length; }
       catch (e) { log('歌单曲目失败 ' + p.name + ': ' + e.message); }
     }
-    // 没有封面的在线歌单：拉一次曲目，随机取一首带封面的歌当歌单封面。
-    // Folia 侧 coverArt 为空会画占位图标，一片灰很难看。拉到的曲目顺便进目录。
-    for (const p of pls.filter(x => x.srcId && !x.cover)) {
-      try {
-        p.tracks = p.tracks || await fetchPlaylistTracks(p.srcId);
-        p.tracks.forEach(catalogAdd);
-        p.count = p.tracks.length;
-        const withCover = p.tracks.filter(t => t.cover);
-        if (withCover.length) p.cover = withCover[Math.floor(Math.random() * withCover.length)].cover;
-      } catch (e) { log('补封面失败 ' + p.name + ': ' + e.message); }
+    // 没有封面的歌单：直接从已缓存的曲库里随机取一首带封面的当歌单封面。
+    // 不拉曲目（零请求）；封面只是"随机装饰"，不必对应歌单内容。
+    const coverPool = [...CATALOG.tracks.values()].filter(t => t.cover);
+    for (const p of pls.filter(x => !x.cover)) {
+      if (coverPool.length) p.cover = coverPool[Math.floor(Math.random() * coverPool.length)].cover;
     }
     CATALOG.playlists = pls;
     CATALOG.loadedAt = Date.now();
-    prewarmFeed();   // 预热推荐流池
-    try { await fillFeed(feedTarget()); } catch (e) { }   // 等池子填满，下面要用它给推荐流歌单补封面
-    // live 歌单（推荐流）没有封面时：从池子里随机取一首带封面的歌当歌单封面。
-    // 之前只在「打开过该歌单的详情页」之后才回填，首次启动永远显示占位图标。
-    for (const p of pls.filter(x => x.live && !x.cover)) {
-      const withCover = (feedPool.q || []).filter(t => t.cover);
-      if (withCover.length) p.cover = withCover[Math.floor(Math.random() * withCover.length)].cover;
-    }
+    prewarmFeed();   // 预热推荐流池（后台，不等待）
     log('目录已刷新：' + CATALOG.tracks.size + ' 曲 / ' + CATALOG.albums.size + ' 专辑 / ' + CATALOG.artists.size + ' 歌手 / ' +
       pls.length + ' 歌单，用时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's');
   })().finally(() => { CATALOG.loading = null; });
