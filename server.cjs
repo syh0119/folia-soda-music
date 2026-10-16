@@ -303,6 +303,25 @@ function log(...a) {
   LOG_RING.push(line);
   if (LOG_RING.length > 300) LOG_RING.shift();
 }
+
+/**
+ * 后台初始化（设备身份 / 登录态 / 曲库）的「就绪门」。
+ *
+ * 为什么需要它：start() 在端口 listen 成功后就**立刻**返回，把上面那几件慢活儿
+ * （子进程加载原生模块、联网注册设备、PowerShell 解 DPAPI、拉整份曲库）放到后台。
+ * 内嵌进 Folia 时这些要几十秒，以前全挡在 start() 里 —— handle 迟迟不返回，
+ * 模组的 client 在 20 来秒内探活失败就彻底放弃，宿主的 Navidrome 配置因此永远
+ * 配不上新的随机密钥（现象：服务明明在跑，NAVI 页签却一直连不上）。
+ *
+ * 就绪之前，数据面（/rest/*）最多等一小会儿，免得 Folia 首次拉库拿到空结果。
+ */
+let READY = null;                       // 后台初始化的 promise；null = 还没开始
+let READY_DONE = false;                 // 后台初始化是否已经结束（成功或失败都算）
+let STOPPED = false;                    // stop() 之后后台流程不要再往下走
+const waitReady = async (ms) => {
+  if (!READY) return;
+  await Promise.race([READY, new Promise((r) => setTimeout(r, ms))]);
+};
 const UI_HTML = (() => { try { return fs.readFileSync(path.join(ASSET, 'ui.html'), 'utf8'); } catch (e) { return '<h1>ui.html 缺失</h1>'; } })();
 
 // ============================================================ 设备身份 + 登录态
@@ -1834,6 +1853,11 @@ const server = http.createServer(async (rq, rs) => {
     return rs.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
   }
 
+  // ---- 后台初始化（设备身份 / 登录态 / 曲库）还没跑完时，数据面先等一会儿 ----
+  // Folia 启动后会马上来拉 NAVI 的列表；这时候返回空库会被当成「里面没有内容」。
+  // 最多等 10 秒，等不到就照常处理，不把请求挂死。
+  if (u.pathname.startsWith('/rest/')) await waitReady(10000);
+
   if (u.pathname === '/api/feed') {
     // 给模组的「无限续播」用：每次返回一批全新的推荐（池子是 splice 式的，天然不重复）
     let out;
@@ -1986,28 +2010,48 @@ async function start(opts = {}) {
   log('Folia 里填：Navidrome 服务器 http://' + HOST + ':' + PORT + '　用户名 ' + USER + '　密码 ' + SECRET);
   log('设置页（带令牌，仅本机可开）：http://' + HOST + ':' + PORT + '/?token=' + TOKEN);
 
-  try { await initNative(); } catch (e) { log('原生模块不可用: ' + e.message); }
+  // ---- 后台初始化 ------------------------------------------------------------
+  // 顺序不能乱：原生签名器 → 设备身份 → 登录态 → 曲库。每一步失败都只记日志，
+  // 不让整条链断掉（比如拿不到登录态时，封面和播放仍然能用）。
+  //
+  // ⚠️ 这一段**故意不 await**：端口已经 listen 成功，handle 立刻交出去，
+  //    模组的 client 才能马上拿到端口 / 密钥 / 令牌去配置宿主的 Navidrome。
+  STOPPED = false;
+  READY = (async () => {
+    try { await initNative(); } catch (e) { log('原生模块不可用: ' + e.message); }
+    if (STOPPED) return;
+    try {
+      if (!loadDevice()) await registerDevice();
+      else { log('设备身份 did=' + DEV.did); await initBdms(); }
+    } catch (e) { log('设备身份初始化失败: ' + e.message); }
+    if (STOPPED) return;
+    loadSession();
+    if (!COOKIE || opts.forceSessionSync) {
+      try { await refreshSessionFromClient(); }
+      catch (e) { log('登录态同步失败（歌单/搜索将不可用）: ' + e.message); }
+    } else {
+      log('已载入登录态（' + COOKIE.length + ' 字符）');
+    }
+    if (STOPPED) return;
+    try { await refreshCatalog(true); } catch (e) { log('首次刷新目录失败: ' + e.message); }
+    if (!STOPPED) {
+      log('初始化完成 → 曲库 ' + CATALOG.tracks.size + ' 曲 / ' + CATALOG.playlists.length + ' 歌单');
+      READY_DONE = true;
+    }
+  })().catch((e) => {
+    READY_DONE = true;                       // 失败也算「结束」，不能把 /rest 一直挂着
+    log('后台初始化异常: ' + ((e && e.message) || e));
+  });
 
-  try {
-    if (!loadDevice()) await registerDevice();
-    else { log('设备身份 did=' + DEV.did); await initBdms(); }
-  } catch (e) { log('设备身份初始化失败: ' + e.message); }
-
-  loadSession();
-  if (!COOKIE || opts.forceSessionSync) {
-    try { await refreshSessionFromClient(); }
-    catch (e) { log('登录态同步失败（歌单/搜索将不可用）: ' + e.message); }
-  } else {
-    log('已载入登录态（' + COOKIE.length + ' 字符）');
-  }
-
-  try { await refreshCatalog(true); } catch (e) { log('首次刷新目录失败: ' + e.message); }
-  const timer = setInterval(() => refreshCatalog(true).catch(() => { }), CATALOG_TTL);
+  const timer = setInterval(() => { if (READY_DONE && !STOPPED) refreshCatalog(true).catch(() => { }); }, CATALOG_TTL);
 
   return {
     port: PORT, host: HOST, user: USER, pass: SECRET, token: TOKEN,
+    // 给 status rpc 用：服务已监听 = 可用；ready 只表示曲库等后台初始化是否也跑完了
+    initDone: () => READY_DONE,
     log: () => LOG_RING.slice(),
     stop() {
+      STOPPED = true;
       try { clearInterval(timer); } catch (e) { }
       hostStop();
       return new Promise((resolve) => {

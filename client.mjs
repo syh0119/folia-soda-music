@@ -38,18 +38,46 @@ export default function activate(folium) {
    */
   const CONN = { port: 0, user: '', pass: '', token: '' };
   let saidNoPass = false;
-  const connReady = (async () => {
-    try {
-      const st = await folium.rpc.call('status');
-      if (st && st.running) {
-        CONN.port = st.port || 0;
-        CONN.user = st.user || '';
-        CONN.pass = st.pass || '';
-        CONN.token = st.token || '';
-      }
-    } catch (e) { /* 旧宿主没有这个 rpc：下面会退回设置里手填的值 */ }
-    return CONN;
+  /**
+   * 反复问 main 直到服务真的在监听，然后拿着端口 / 密钥 / 令牌继续。
+   *
+   * 为什么是轮询而不是问一次（这是 v2.2.0 里导致「服务在跑但 NAVI 连不上」的根因）：
+   * main 侧 boot() 是异步的，端口 listen 之前 status 会回 running=false。
+   * 旧写法只问一次，撞上 running=false 就把 CONN 定死成空，之后**再也不会重问** ——
+   * 于是探活一轮一轮 401，宿主的 Navidrome 配置永远拿不到新的随机密钥。
+   *
+   * 上限约 60 秒：正常情况端口 1~2 秒就起来；拉曲库要几十秒，但那只影响 ready，
+   * 不影响这里（令牌和端口在 listen 成功那一刻就有了）。
+   */
+  let connReadyResolve = null;
+  const connReady = new Promise((resolve) => { connReadyResolve = resolve; });
+  (async () => {
+    for (let i = 0; i < 150; i += 1) {
+      try {
+        const st = await folium.rpc.call('status');
+        if (st && st.running) {
+          CONN.port = st.port || 0;
+          CONN.user = st.user || '';
+          CONN.pass = st.pass || '';
+          CONN.token = st.token || '';
+          if (CONN.pass && CONN.token) {
+            say('main 已就绪：端口 ' + CONN.port + (st.ready ? '（曲库也好了）' : '（曲库还在后台拉）'));
+            break;
+          }
+        }
+      } catch (e) { /* 旧宿主没有这个 rpc：下面会退回设置里手填的值 */ }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    connReadyResolve(CONN);
   })();
+
+  /**
+   * 一拿到数据面密钥就纠正宿主的 Navidrome 配置 —— **不要等 HTTP 探活**。
+   * 探活用的是控制面令牌，Navidrome 用的是数据面密钥，两者没有先后依赖；
+   * 旧版把「探活成功」写成配 Navidrome 的前提，探活一失败密码就永远纠正不过来，
+   * 于是 NAVI 页签一直拿旧口令去连、报「服务不可用」。
+   */
+  connReady.then(() => { if (CONN.pass) ensureNavidromePreset(); });
 
   /**
    * 读/写模组自己的小状态。
@@ -969,16 +997,19 @@ export default function activate(folium) {
         } catch (e) { }
       })
       .catch((e) => {
-        if (tries < 12) { setTimeout(probe, 1500); return; }
+        // /api/status 不等后台初始化，所以这里失败基本就是「端口还没 listen」
+        // 或「令牌还没拿到」。40 × 2 秒 = 80 秒余量（旧版 12 × 1.5 秒 ≈ 18 秒就放弃，
+        // 曲库都还没拉完）。
+        if (tries < 40) { setTimeout(probe, 2000); return; }
         say('音源服务没起来（' + e.message + '）—— 看模组面板里「汽水音乐」的日志');
         try { folium.ui.toast('汽水音乐：音源服务没起来，看模组面板的日志', { type: 'error', durationMs: 9000 }); } catch (e2) { }
       });
   };
-  // 等服务把端口/密钥/令牌报上来再探活 —— 否则会拿着空密码去打一轮没意义的请求。
-  // 主进程要是没回（旧宿主 / rpc 卡住），4 秒后照样开探，别把启动流程堵死。
+  // 先等 main 把端口 / 密钥 / 令牌报上来再探活 —— 否则只能拿空令牌打一轮没意义的 401。
+  // 万一 rpc 一直不回（旧宿主 / 卡住），20 秒后照样开探，别把启动流程堵死。
   let probeStarted = false;
   const startProbe = () => { if (probeStarted) return; probeStarted = true; probe(); };
-  Promise.race([connReady, new Promise((r) => setTimeout(r, 4000))]).then(startProbe, startProbe);
+  Promise.race([connReady, new Promise((r) => setTimeout(r, 20000))]).then(startProbe, startProbe);
 
   // 激活时如果正在放我们的歌，先备一份逐字歌词
   try {

@@ -77,8 +77,13 @@ module.exports = function activate(api) {
 
   // 交给 client 的全部连接信息：端口 / 数据面密码 / 控制面令牌。
   // 令牌每次启动重生成，只走 rpc（不进 URL、不落盘），所以任意网页拿不到。
+  //
+  // running = 端口已经在监听了 —— 服务可用，client 可以立刻拿密钥去配宿主的 Navidrome。
+  // ready   = 后台初始化（原生模块 / 设备身份 / 登录态 / 曲库）也跑完了；
+  //           **不要用它来判断「能不能连」**：曲库要几十秒才拉完，client 只等 running。
   api.rpc.handle('status', async () => ({
     running: !!handle,
+    ready: handle ? !!handle.initDone() : false,
     port: handle ? handle.port : null,
     host: handle ? handle.host : null,
     user: handle ? handle.user : null,
