@@ -197,6 +197,19 @@ export default function activate(folium) {
     const c = creds();
     return 'u=' + encodeURIComponent(c.user) + '&p=' + encodeURIComponent(c.pass) + '&v=1.16.1&c=Folia&f=json';
   };
+  /**
+   * 封面 URL 一律用**大写协议**（HTTP://）。⚠️ 别「规范化」回小写！
+   *
+   * 宿主的「预取 / 离线缓存」会把 http: 开头的封面地址**盲目改写成 https:**
+   * （asar 的 Prefetch 与封面缓存两处都没有排除 127.0.0.1 / localhost，只有歌单墙那边的
+   * 归一化排除了），而本机服务只有 HTTP —— 改写后的地址连不上，封面就空白了。
+   * 更糟的是宿主把它存进 `cachedCoverUrl`（优先级高于歌曲对象上的封面），
+   * 一旦坏掉就一直空白 —— 正是「切换瞬间正常、随后空白、前几首正常后头不行」的完整解释。
+   *
+   * URL scheme 大小写不敏感，Chromium 照常按 http 加载；宿主的
+   * `startsWith('http:')` 判不到大写，改写被跳过。已实测修复「封面空白」。
+   */
+  const coverBase = () => base().replace(/^http:/, 'HTTP:');
   /** 控制面请求（/api/*）：带上每次启动随机的令牌 —— 少了它服务端一律 401 */
   const apiFetch = (path, init) => folium.net.fetch(base() + path, Object.assign({}, init || {}, {
     headers: Object.assign({}, (init && init.headers) || {}, CONN.token ? { 'x-soda-token': CONN.token } : {}),
@@ -220,7 +233,7 @@ export default function activate(folium) {
     artists: String(s.artist || '').split(/\s*\/\s*/).filter(Boolean),
     album: s.album || undefined,
     coverUrl: s.coverArt
-      ? base() + '/rest/getCoverArt?' + auth() + '&id=' + encodeURIComponent(s.coverArt) + '&size=600'
+      ? coverBase() + '/rest/getCoverArt?' + auth() + '&id=' + encodeURIComponent(s.coverArt) + '&size=600'
       : undefined,
     durationMs: (Number(s.duration) || 0) * 1000,
   });
@@ -348,13 +361,11 @@ export default function activate(folium) {
   const QUEUE_MAX = 100;                          // 队列上限：超过就裁掉前面序号靠前的
   const FM_TICK_MS = 10000;                       // 盯队列的间隔
   let fmTimer = null;
-  let curShapeDumped = false;   // 只把宿主曲目对象形状留档一次
-
   /** 把汽水的推荐流歌曲转成宿主内部的 UnifiedSong（字段照 omniProviders.ts 的 toUnifiedSong） */
   const toUnified = (s) => {
     const id = String(s.id);
     const cover = s.cover
-      ? base() + '/rest/getCoverArt?' + auth() + '&id=' + encodeURIComponent(s.cover) + '&size=600'
+      ? coverBase() + '/rest/getCoverArt?' + auth() + '&id=' + encodeURIComponent(s.cover) + '&size=600'
       : '';
     return {
       id,
@@ -403,7 +414,11 @@ export default function activate(folium) {
     try {
       const pb = folium.playback;
       if (!pb || typeof pb.enqueue !== 'function') return false;
-      return !!pb.enqueue({ ref: 'online:' + PROVIDER_ID + ':' + song.id });
+      // ⚠️ 必须把**完整的歌曲 DTO** 一起交过去，不能只给 ref。
+      // 只给 `{ ref }` 时宿主会回头调 provider 的 `getSong()` 补详情，而那条适配路径
+      // 拿不到封面 —— 表现就是「歌单里的歌有封面，续播进来的没封面」
+      // （歌单走 Navidrome 通道，封面由 Subsonic 的 coverArt 给，所以只有续播受影响）。
+      return !!pb.enqueue(Object.assign({ ref: 'online:' + PROVIDER_ID + ':' + song.id }, song));
     } catch (e) { return false; }
   }
 
@@ -425,22 +440,6 @@ export default function activate(folium) {
       const remain = ci >= 0 ? q.length - ci - 1 : q.length;
       if (remain > FM_REMAIN) return;
       const have = new Set(q.map(x => String(x.id)));
-      // 一次性把宿主给的曲目对象形状留档：万一下次 id 取法又变了，直接看这个
-      if (cur && !curShapeDumped) {
-        curShapeDumped = true;
-        try {
-          flagsSet('__curShape', {
-            at: new Date().toISOString(),
-            curId, seedId,
-            source: cur.source == null ? '(无字段)' : String(cur.source),
-            curKeys: Object.keys(cur),
-            curSourceRef: cur.sourceRef ? JSON.parse(JSON.stringify(cur.sourceRef)) : null,
-            queueItemKeys: q[0] ? Object.keys(q[0]) : [],
-            queueItemId: q[0] ? String(q[0].id) : '',
-            queueItemSourceRef: q[0] && q[0].sourceRef ? JSON.parse(JSON.stringify(q[0].sourceRef)) : null,
-          }).catch(() => { });
-        } catch (e) { }
-      }
       // 把当前曲目交给服务端当上下文：它反查出这首歌属于哪个歌单，
       // 优先续那个歌单里的歌（不够才落回通用推荐流）。
       const got = await feedSongs(FM_BATCH, seedId);
@@ -449,13 +448,17 @@ export default function activate(folium) {
       // 先试公开 API；一首都没进去才退回内部 store（避免两条路同时追加造成重复）
       let added = 0;
       for (const s of songs) if (enqueueViaPublicApi(s)) added += 1;
+      const viaApi = added > 0;
       if (added === 0) {
         let nq = q.concat(songs);
         if (nq.length > QUEUE_MAX) nq = nq.slice(nq.length - QUEUE_MAX);   // 超上限：去掉前面序号靠前的
         st.setPlayQueue(nq);
         added = songs.length;
       }
+      // 日志里写清走了哪条 —— 公开 enqueue 宿主只取 ref（DTO 其余字段会被丢掉），
+      // 走不通时退回内部 store 直接写队列（曲目对象自带 album.coverUrl）。
       say('无限续播：已续上 ' + added + ' 首'
+        + (viaApi ? '（走公开 enqueue）' : '（退回内部 store）')
         + (got.source ? '，跟着「' + got.source + '」'
                       : '（通用推荐流；当前曲目 id=' + (curId || '拿不到') + '）'));
     };

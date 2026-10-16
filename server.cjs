@@ -1139,7 +1139,7 @@ async function lunaRelatedTracks(seedIds, dump) {
  * 给出去的会记进 feedPool.seen，并顺手从待发队列里摘掉，保证同一次会话内不重复。
  *
  * 返回里带一个 `info`，说明这次为什么走上/没走上歌单 —— 续播出问题时全靠它定位，
- * 会被写进 paths.data/diag.json（见 diagAdd）。
+ * 设 `SODA_DIAG=1` 后会写进 paths.data/diag.json（见 diagAdd）。
  */
 async function takeFromContext(seedId, n) {
   const info = {
@@ -1269,10 +1269,13 @@ async function serveFromPlaylists(plIds, seedId, n, usedName, info) {
  * 续播决策的落盘记录。
  * 模组日志只发给渲染端、**不落盘**，而「续播为什么没跟上歌单」光看界面看不出来。
  * 所以把每次 /api/feed 的决策写进 paths.data/diag.json（最近 40 条），出问题直接读文件。
+ * **默认关闭**（每次写盘不值得常开）：设环境变量 `SODA_DIAG=1` 才启用 —— 排查时打开即可。
  * 诊断本身绝不能影响功能 —— 所有失败都吞掉。
  */
+const DIAG_ON = process.env.SODA_DIAG === '1';
 const DIAG = [];
 function diagAdd(rec) {
+  if (!DIAG_ON) return;
   try {
     DIAG.push(rec);
     if (DIAG.length > 40) DIAG.shift();
@@ -1875,7 +1878,11 @@ const ROUTES = {
     if (id && id.startsWith(PH_PREFIX)) return sendPlaceholder(res, id.slice(PH_PREFIX.length), px);
     const f = path.join(cacheDir(), 'cover_' + md5(id + '@' + px) + '.jpg');
     if (fs.existsSync(f)) return sendImage(res, fs.readFileSync(f));
-    const t = CATALOG.tracks.get(id) || [...CATALOG.tracks.values()].find(x => x.albumId === id);
+    // ⚠️ 别对「完整 URL 形式的 id」做曲库查找：那是一次几百首的全表遍历，而按定义不可能命中。
+    // 墙上有几百张卡片同时请求封面时这段会被放大成明显的卡顿。
+    const isUrlId = /^https?:\/\//i.test(String(id || ''));
+    const t = isUrlId ? null
+      : (CATALOG.tracks.get(id) || [...CATALOG.tracks.values()].find(x => x.albumId === id));
     // 只认「曲目自带的封面」或「白名单 CDN 上的链接」；其它一律走占位图，绝不代发请求
     const base = (t && t.cover) || (isAllowedCoverUrl(id) ? id : '');
     if (!base) return sendPlaceholder(res, coverLabel(id), px);
@@ -1889,7 +1896,9 @@ const ROUTES = {
         const b2 = await getBuf(base);
         fs.writeFileSync(f, b2);
         return sendImage(res, b2);
-      } catch (e2) { return sendPlaceholder(res, coverLabel(id), px); }   // CDN 挂了也别破图
+      } catch (e2) {
+        return sendPlaceholder(res, coverLabel(id), px);   // CDN 挂了也别破图
+      }
     }
   },
   stream: async (q, res, reqObj) => {
