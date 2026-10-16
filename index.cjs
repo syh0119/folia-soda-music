@@ -11,44 +11,42 @@
  * 模组被撤销授权并保持禁用。
  *
  * Folium 1.5 起用宿主给的 api.storage.paths（两个 getter，每次读取时目录不存在会先建出来）：
- *   · paths.data  —— 要保留的文件（登录态、设备标识）
+ *   · paths.data  —— 要保留的文件（登录态、设备标识、本机服务密钥 auth.json）
  *   · paths.cache —— 可重建的缓存（解密音频 / 歌词 / 封面），用户可随时在模组面板清空
- * 不支持 paths 的旧宿主（0.7.19 / Folium 1.4）退回 %APPDATA%\luna_export\soda。
+ * 拿不到 paths 就**直接失败**（不再回退到没申报过的 %APPDATA%\luna_export\soda）。
  * 路径一律按需现取（宿主是 getter，且缓存随时可能被清），不在启动时存字符串。
  *
- * 原生模块（bdms.node / device.node / metasecml.dll）**不随模组分发**，
- * 首次运行时从用户自己的汽水音乐客户端目录探测（见 server.cjs 的 resolveNativeDir）。
+ * 需要申报的系统操作（详见 README「这个模组动了什么」一节）：
+ *   · PowerShell —— 只用来调 DPAPI 解 Chromium Cookies 的加密主密钥（一次性、用完即弃）
+ *   · reg query  —— 汽水客户端启动日志里找不到安装目录时，回退查注册表卸载项
+ *   · 原生模块   —— bdms.node / device.node / metasecml.dll **不随模组分发**，从用户自己的
+ *                   汽水客户端目录探测；且**在独立子进程里加载**（native-host.cjs），
+ *                   不进宿主主进程、也不改主进程的 PATH / cwd
+ *   · 联网       —— 以官方客户端的 UA 调 api.qishui.com；首次会以本机序列号注册一个设备身份
  */
 'use strict';
 
-const os = require('os');
+const fs = require('fs');
 const path = require('path');
 
 const server = require('./server.cjs');
 
-/** 旧布局兜底：不支持 api.storage.paths 的宿主 */
-function legacyPaths() {
-  const root = path.join(
-    process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
-    'luna_export',
-    'soda',
-  );
-  return { data: root, cache: path.join(root, '_cache') };
-}
-
 /**
  * 返回一个「每次调用都现取路径」的函数交给 server.start。
  * 宿主是 getter：目录不存在时会先建出来；用户清空缓存后也照常工作。
+ *
+ * **不做任何兜底**（维护者审查意见）：拿不到 api.storage.paths 就直接失败。
+ * 以前会退回 `%APPDATA%\luna_export\soda`，那是个既没申报、也和模组数据无关的位置；
+ * 更糟的是内嵌运行时「没有路径」的兜底默认值就是模组目录本身 —— 往那里写一个字
+ * 都会让模组授权摘要失配、模组被撤销授权。宁可起不来并说清原因。
  */
 function makeResolvePaths(api) {
   const st = api && api.storage;
-  const supported = !!(st && st.paths);   // 等价于 'paths' in api.storage
   return () => {
-    if (supported) {
-      try { return { data: st.paths.data, cache: st.paths.cache }; }
-      catch (e) { /* 权限缺失等 → 退回旧布局，别让服务起不来 */ }
+    if (!st || !st.paths) {
+      throw new Error('宿主没有 api.storage.paths —— 需要 Folium 1.5 / Folia 0.7.20 及以上；本模组不再回退到未申报的目录');
     }
-    return legacyPaths();
+    return { data: st.paths.data, cache: st.paths.cache };
   };
 }
 
@@ -65,7 +63,7 @@ module.exports = function activate(api) {
     if (starting) return;
     starting = true;
     try {
-      handle = await server.start({ resolvePaths });
+      handle = await server.start({ resolvePaths, embedded: true });
       lastError = null;
       api.log.info('[汽水] 音源服务已就绪 → http://127.0.0.1:' + handle.port);
     } catch (e) {
@@ -77,12 +75,15 @@ module.exports = function activate(api) {
     }
   }
 
+  // 交给 client 的全部连接信息：端口 / 数据面密码 / 控制面令牌。
+  // 令牌每次启动重生成，只走 rpc（不进 URL、不落盘），所以任意网页拿不到。
   api.rpc.handle('status', async () => ({
     running: !!handle,
     port: handle ? handle.port : null,
+    host: handle ? handle.host : null,
     user: handle ? handle.user : null,
     pass: handle ? handle.pass : null,
-    dataDir: dataRoot,
+    token: handle ? handle.token : null,
     error: lastError,
     nativeDir: safe(() => server.resolveNativeDir(), null),
     clientDirs: safe(() => server.clientInstallDirs(), []),
@@ -97,6 +98,20 @@ module.exports = function activate(api) {
   });
 
   api.rpc.handle('log', async () => (handle ? handle.log().slice(-120) : []));
+
+  // 模组自己的小状态（无限续播的开关等），落在 paths.data 里。
+  // 以前是往**宿主的 localStorage** 写 `soda_endless_fm` —— 模组不该静默改宿主配置，改走这里。
+  const stateFile = () => path.join(resolvePaths().data, 'state.json');
+  const readState = () => { try { return JSON.parse(fs.readFileSync(stateFile(), 'utf8')) || {}; } catch (e) { return {}; } };
+  api.rpc.handle('flags', async (arg) => {
+    const cur = readState();
+    if (!arg || typeof arg.key !== 'string') return cur;
+    try {
+      if (arg.remove) delete cur[arg.key]; else cur[arg.key] = arg.value;
+      fs.writeFileSync(stateFile(), JSON.stringify(cur, null, 1));
+    } catch (e) { /* 写不了就算了，别让功能整个挂掉 */ }
+    return cur;
+  });
 
   // 各个 Electron 窗口的状态 —— 用来判断诊断时主窗口有没有被面板/浮层遮挡或失焦
   // （Chromium 的遮挡检测会在窗口被挡住/失焦时主动降频，那会让测出来的帧率偏低）
@@ -206,8 +221,6 @@ module.exports = function activate(api) {
       return { hz: 0, error: (e && e.message) || String(e) };
     }
   });
-
-  try { fs.mkdirSync(dataRoot, { recursive: true }); } catch (e) { }
 
   boot();
 

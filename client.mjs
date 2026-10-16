@@ -19,12 +19,60 @@
 const DEFAULTS = {
   server: 'http://127.0.0.1:4533',
   user: 'soda',
-  pass: 'soda',
+  pass: '',                 // 留空 = 用 main 通过 rpc 报上来的随机密钥（auth.json），不用手填
   lyrics: true,
+  autoNavidrome: true,      // 首次运行时把书库的 Navidrome 页签指向本机音源（见 ensureNavidromePreset）
 };
 
 export default function activate(folium) {
   const say = (m) => { try { folium.log.info('[汽水] ' + m); } catch (e) { } };
+
+  /**
+   * main 通过 rpc 报上来的连接信息（每次启动都可能变）：
+   *   port       —— 实际监听端口
+   *   user/pass  —— 数据面（`/rest/*`）的用户名与随机密钥（auth.json，**持久**）
+   *   token      —— 控制面（`/api/*`）令牌，**每次启动重生成**，不落盘、不进任何对外的 URL
+   *
+   * 为什么密码不再写死 soda/soda：维护者审查指出固定口令等于没有鉴权。
+   * 现在 /rest 用随机密钥（宿主的 Navidrome 配置里存的就是它），/api 再叠一层一次性令牌。
+   */
+  const CONN = { port: 0, user: '', pass: '', token: '' };
+  let saidNoPass = false;
+  const connReady = (async () => {
+    try {
+      const st = await folium.rpc.call('status');
+      if (st && st.running) {
+        CONN.port = st.port || 0;
+        CONN.user = st.user || '';
+        CONN.pass = st.pass || '';
+        CONN.token = st.token || '';
+      }
+    } catch (e) { /* 旧宿主没有这个 rpc：下面会退回设置里手填的值 */ }
+    return CONN;
+  })();
+
+  /**
+   * 读/写模组自己的小状态。
+   * 首选宿主的**模组专用存储** `folium.storage`（按 modId 隔离，宿主自己管的）；
+   * 旧宿主没有就退回 main 侧的 `flags` rpc（写进 paths.data/state.json）。
+   * 两条路都不碰**宿主的** localStorage。
+   */
+  const modStore = (() => {
+    try { const s = folium.storage; return (s && typeof s.get === 'function') ? s : null; }
+    catch (e) { return null; }
+  })();
+  const flagsGet = async (key) => {
+    try { if (modStore) return await modStore.get(key); } catch (e) { }
+    try { return (await folium.rpc.call('flags'))[key]; } catch (e) { return undefined; }
+  };
+  const flagsSet = async (key, value) => {
+    try { if (modStore) { await modStore.set(key, value); return; } } catch (e) { }
+    try { await folium.rpc.call('flags', { key, value }); } catch (e) { }
+  };
+  const flagsDel = async (key) => {
+    try { if (modStore) { await modStore.delete(key); return; } } catch (e) { }
+    try { await folium.rpc.call('flags', { key, remove: true }); } catch (e) { }
+  };
 
   // ---------------------------------------------------------------- 设置分区
   const section = folium.registries.settingsSections.register({
@@ -45,8 +93,33 @@ export default function activate(folium) {
         defaultValue: DEFAULTS.server,
         description: { 'zh-CN': '默认 http://127.0.0.1:4533', en: 'Default http://127.0.0.1:4533' },
       },
-      { key: 'user', type: 'text', label: { 'zh-CN': '用户名', en: 'Username' }, defaultValue: DEFAULTS.user },
-      { key: 'pass', type: 'text', label: { 'zh-CN': '密码', en: 'Password' }, defaultValue: DEFAULTS.pass },
+      {
+        key: 'user', type: 'text',
+        label: { 'zh-CN': '用户名', en: 'Username' },
+        defaultValue: DEFAULTS.user,
+        description: { 'zh-CN': '内建服务固定为 soda', en: 'Fixed to "soda" for the bundled server' },
+      },
+      {
+        key: 'pass', type: 'text',
+        label: { 'zh-CN': '密码（留空 = 用自动生成的密钥）', en: 'Password (blank = auto key)' },
+        defaultValue: DEFAULTS.pass,
+        description: {
+          'zh-CN': '内建服务的密码是启动时自动生成/读取的随机密钥（存在数据目录的 auth.json），正常不用填。' +
+            '只有把「服务器地址」指向别处自建的服务时才需要手填。',
+          en: 'Blank = the bundled server\'s auto-generated key (auth.json in the data dir).',
+        },
+      },
+      {
+        key: 'autoNavidrome', type: 'boolean',
+        label: { 'zh-CN': '自动配置 Navidrome 页签', en: 'Auto-configure Navidrome tab' },
+        defaultValue: DEFAULTS.autoNavidrome,
+        description: {
+          'zh-CN': '开着时会把书库的 Navidrome 页签指到本机音源 —— 这是本模组**唯一**会改宿主配置的地方' +
+            '（写宿主的 navidrome_config / navidrome_enabled），而且只在你还没配过、或本来就指向本机时才写。' +
+            '不想让它动宿主配置就关掉，然后按模组日志里打印的地址和密码自己填。',
+          en: 'When on, points the library Navidrome tab at the local server. Turn off to configure it yourself.',
+        },
+      },
       {
         key: 'lyrics', type: 'boolean',
         label: { 'zh-CN': '逐字歌词', en: 'Word-by-word lyrics' },
@@ -77,9 +150,29 @@ export default function activate(folium) {
   });
 
   const cfg = () => Object.assign({}, DEFAULTS, section.params.get() || {});
-  const base = () => String(cfg().server || DEFAULTS.server).replace(/\/+$/, '');
-  const auth = () => 'u=' + encodeURIComponent(cfg().user) + '&p=' + encodeURIComponent(cfg().pass) +
-    '&v=1.16.1&c=Folia&f=json';
+  /** 设置里的地址还是本机那台时，用 main 报上来的真实端口（端口可能被改过） */
+  const base = () => {
+    const s = String(cfg().server || DEFAULTS.server).replace(/\/+$/, '');
+    if (CONN.port && /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(s)) return 'http://127.0.0.1:' + CONN.port;
+    return s;
+  };
+  /** 连的是内建服务就用 main 给的随机凭据；设置里明显指向别处时尊重用户填的 */
+  const creds = () => {
+    const c = cfg();
+    const builtin = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(String(c.server || ''));
+    return {
+      user: (builtin && CONN.user) || c.user || DEFAULTS.user,
+      pass: (builtin && CONN.pass) || c.pass || '',
+    };
+  };
+  const auth = () => {
+    const c = creds();
+    return 'u=' + encodeURIComponent(c.user) + '&p=' + encodeURIComponent(c.pass) + '&v=1.16.1&c=Folia&f=json';
+  };
+  /** 控制面请求（/api/*）：带上每次启动随机的令牌 —— 少了它服务端一律 401 */
+  const apiFetch = (path, init) => folium.net.fetch(base() + path, Object.assign({}, init || {}, {
+    headers: Object.assign({}, (init && init.headers) || {}, CONN.token ? { 'x-soda-token': CONN.token } : {}),
+  }));
 
   /** 调 Subsonic 接口；net.fetch 的 json() 是同步方法，不要 await */
   async function call(ep, params) {
@@ -131,8 +224,7 @@ export default function activate(folium) {
     async getLyrics(song) {
       if (!cfg().lyrics) return null;
       try {
-        const r = await folium.net.fetch(
-          base() + '/api/lyrics?id=' + encodeURIComponent(song.id), { timeoutMs: 25000 });
+        const r = await apiFetch('/api/lyrics?id=' + encodeURIComponent(song.id), { timeoutMs: 25000 });
         if (!r.ok) return null;
         const j = r.json();
         if (!j || !j.ok || !j.text) return null;
@@ -156,7 +248,7 @@ export default function activate(folium) {
     keywords: ['汽水', '登录', 'soda', 'login', 'session', '同步'],
     run: async () => {
       try {
-        const r = await folium.net.fetch(base() + '/api/refresh_session', { method: 'POST', timeoutMs: 60000 });
+        const r = await apiFetch('/api/refresh_session', { method: 'POST', timeoutMs: 60000 });
         const j = r.json();
         if (j && j.ok) {
           say('登录态同步成功：' + (j.hint || ''));
@@ -183,7 +275,7 @@ export default function activate(folium) {
     keywords: ['汽水', '刷新', 'soda', 'refresh', 'catalog'],
     run: async () => {
       try {
-        const r = await folium.net.fetch(base() + '/api/refresh_catalog', { method: 'POST', timeoutMs: 60000 });
+        const r = await apiFetch('/api/refresh_catalog', { method: 'POST', timeoutMs: 60000 });
         const j = r.json();
         if (j && j.ok) { say('曲库目录已刷新'); return { message: '曲库目录已刷新，NAVI 页签里重新进入即可看到。' }; }
         const err = (j && j.error) || ('HTTP ' + r.status);
@@ -229,25 +321,41 @@ export default function activate(folium) {
 
   /** 从音源服务取一批全新的推荐歌 */
   async function feedSongs(n) {
-    const r = await folium.net.fetch(base() + '/api/feed?n=' + (n || FM_BATCH), { timeoutMs: 60000 });
+    const r = await apiFetch('/api/feed?n=' + (n || FM_BATCH), { timeoutMs: 60000 });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = r.json();
     if (!j || !j.ok || !Array.isArray(j.songs) || !j.songs.length) return [];
     return j.songs.map(toUnified);
   }
 
-  /** 开启：每 10 秒盯一次队列，快到末尾就追加推荐。开关状态持久化到 localStorage，重启自动恢复 */
+  /**
+   * 往播放队列追加。
+   * 优先用宿主**公开 API**：`folium.playback.enqueue({ ref })`（song DTO 的 ref 形如
+   * `online:<providerId>:<mediaId>`，见宿主 `sourceRef` 的序列化）。它需要 `playback.control` 权限。
+   * 公开 API 不可用、或一首都没被接受时，才退回读取宿主 playback store 的 `setPlayQueue`。
+   *
+   * ⚠️ 退回路径依赖 `folium.internals`（非公开接口，已在 README 里申报），
+   *    所以清单里仍有 `folia` 版本范围；等到 `folium.playback.enqueue` 在实测中稳定后可以整段删掉。
+   */
+  function hostPlaybackStore() {
+    try {
+      const internals = folium.internals;
+      const pb = internals && internals.stores && internals.stores.playback;
+      return (pb && typeof pb.getState === 'function') ? pb : null;
+    } catch (e) { return null; }
+  }
+  function enqueueViaPublicApi(song) {
+    try {
+      const pb = folium.playback;
+      if (!pb || typeof pb.enqueue !== 'function') return false;
+      return !!pb.enqueue({ ref: 'online:' + PROVIDER_ID + ':' + song.id });
+    } catch (e) { return false; }
+  }
+
+  /** 开启：每 10 秒盯一次队列，快到末尾就追加推荐。开关状态存在模组自己的 data 目录，重启自动恢复 */
   function enableEndless() {
-    let internals;
-    try { internals = folium.internals; }
-    catch (e) {
-      throw new Error('这个功能要访问宿主内部接口，需要清单里声明 folia 版本范围（为避免版本绑定，公开发布版已移除该声明）。' +
-        '自用的话在 mod.json 里加一行 "folia": ">=0.7.0 <0.8.0" 就能用。');
-    }
-    const pb = internals && internals.stores && internals.stores.playback;
-    if (!pb || typeof pb.getState !== 'function') throw new Error('拿不到播放 store');
-    try { localStorage.setItem('soda_endless_fm', '1'); } catch (e) { }
-    if (fmTimer) return;
+    const pb = hostPlaybackStore();
+    if (!pb) throw new Error('拿不到播放 store：需要在清单里声明 folia 版本范围（本模组已声明 folia 版本范围）');
     const tick = async () => {
       const st = pb.getState();
       const q = st.playQueue || [];
@@ -260,11 +368,19 @@ export default function activate(folium) {
       const have = new Set(q.map(x => String(x.id)));
       const songs = (await feedSongs(FM_BATCH)).filter(x => !have.has(String(x.id)));
       if (!songs.length) return;
-      let nq = q.concat(songs);
-      if (nq.length > QUEUE_MAX) nq = nq.slice(nq.length - QUEUE_MAX);   // 超上限：去掉前面序号靠前的
-      st.setPlayQueue(nq);
-      say('无限续播：已续上 ' + songs.length + ' 首（队列 ' + nq.length + ' 首）');
+      // 先试公开 API；一首都没进去才退回内部 store（避免两条路同时追加造成重复）
+      let added = 0;
+      for (const s of songs) if (enqueueViaPublicApi(s)) added += 1;
+      if (added === 0) {
+        let nq = q.concat(songs);
+        if (nq.length > QUEUE_MAX) nq = nq.slice(nq.length - QUEUE_MAX);   // 超上限：去掉前面序号靠前的
+        st.setPlayQueue(nq);
+        added = songs.length;
+      }
+      say('无限续播：已续上 ' + added + ' 首');
     };
+    if (fmTimer) return;
+    flagsSet('endless', 1);
     fmTimer = setInterval(() => { tick().catch(() => { }); }, FM_TICK_MS);
     tick().catch(() => { });
   }
@@ -272,23 +388,22 @@ export default function activate(folium) {
   /** 关闭：停止盯队列，并清掉持久化的开关 */
   function disableEndless() {
     if (fmTimer) { clearInterval(fmTimer); fmTimer = null; }
-    try { localStorage.removeItem('soda_endless_fm'); } catch (e) { }
+    flagsDel('endless');
   }
 
   // 恢复持久化的无限续播开关：重启 Folia 后自动开启，不需要手动执行命令。
   // 延迟 3 秒等 playback store 就绪；tick 本身有容错，store 没就绪就下个周期再试。
-  try {
-    if (localStorage.getItem('soda_endless_fm') === '1') {
-      setTimeout(() => { try { enableEndless(); say('无限续播已自动恢复'); } catch (e) { } }, 3000);
-    }
-  } catch (e) { }
+  flagsGet('endless').then((v) => {
+    if (String(v) !== '1') return;
+    setTimeout(() => { try { enableEndless(); say('无限续播已自动恢复'); } catch (e) { } }, 3000);
+  }).catch(() => { });
 
   folium.registries.commands.register({
     id: 'endless-on',
     label: { 'zh-CN': '开启无限续播', en: 'Enable endless radio' },
     description: {
-      'zh-CN': '每 5 秒盯一次播放队列，剩 2 首时自动追加一批全新的汽水推荐（60 首、不重复）。' +
-        '不开私人 FM 模式，播放页的「队列」列表保持原样。重启 Folia 后需重新开启。',
+      'zh-CN': '每 10 秒盯一次播放队列，剩 2 首时自动追加一批全新的汽水推荐（60 首、不重复）。' +
+        '不开私人 FM 模式，播放页的「队列」列表保持原样。开关存在模组数据目录里，重启 Folia 后自动恢复。',
       en: 'Watch the queue every 5s and append fresh Soda recommendations when only 2 songs remain.',
     },
     keywords: ['汽水', '续播', '无限', '推荐', 'fm', 'soda', 'endless', 'radio'],
@@ -380,7 +495,7 @@ export default function activate(folium) {
     if (lyricLines.has(id)) return;
     lyricLines.set(id, null);                       // 占位，避免同一首重复请求
     try {
-      const r = await folium.net.fetch(base() + '/api/lines?id=' + encodeURIComponent(id), { timeoutMs: 20000 });
+      const r = await apiFetch('/api/lines?id=' + encodeURIComponent(id), { timeoutMs: 20000 });
       const j = r.json();
       const lines = (j && j.ok && j.wordByWord && Array.isArray(j.lines)) ? j.lines : null;
       lyricLines.set(id, lines && lines.length ? lines : null);
@@ -782,18 +897,34 @@ export default function activate(folium) {
     say('服务器地址不是本机（' + c0.server + '）');
   }
 
-  // 把书库的 Navidrome 页签自动指到本机音源，省得手填。
-  // 只在「没有配置」或「已经指向本机」时写入 —— 用户自己配的别的 Navidrome 不动。
+  /**
+   * 把书库的 Navidrome 页签指到本机音源，省得手填。
+   *
+   * ⚠️ 这是**唯一**会写宿主配置的地方（`navidrome_config` / `navidrome_enabled`），
+   *    而且只在：① 设置里「自动配置 Navidrome 页签」开着；② 用户还没配过、
+   *    或者已经指向本机 —— 三个条件同时满足时才动手。用户自己配的别的 Navidrome 一律不碰。
+   *    可以在设置里关掉它，关掉后请手动按提示填地址与密码。
+   *    写进去的密码是**本机随机密钥**（不是用户任何账号的密码）。
+   */
   function ensureNavidromePreset() {
+    if (cfg().autoNavidrome === false) return false;
     try {
       const cur = localStorage.getItem('navidrome_config');
       if (cur) {
         let o = null;
         try { o = JSON.parse(cur); } catch (e) { return false; }
         if (o && o.serverUrl && !/^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(o.serverUrl)) return false;
+        // 已经指向本机、且密码就是当前密钥 → 不用重复写
+        if (o && o.serverUrl === base() && o.passwordHash === creds().pass) return false;
+      }
+      const c = creds();
+      // 拿不到密钥（旧宿主没有 status rpc）时宁可不写：写个空密码进去只会把 Navidrome 配坏
+      if (!c.pass) {
+        if (!saidNoPass) { saidNoPass = true; say('拿不到本机服务密钥，先不自动配置 Navidrome —— 请按日志里的地址与密码手动填'); }
+        return false;
       }
       localStorage.setItem('navidrome_config', JSON.stringify({
-        serverUrl: base(), username: cfg().user, passwordHash: cfg().pass,
+        serverUrl: base(), username: c.user, passwordHash: c.pass,
       }));
       localStorage.setItem('navidrome_enabled', 'true');
       localStorage.setItem('navidrome_config_origin', 'manual');
@@ -809,7 +940,8 @@ export default function activate(folium) {
   let tries = 0;
   const probe = () => {
     tries += 1;
-    folium.net.fetch(base() + '/health', { timeoutMs: 6000 })
+    // /api/status 要令牌（默认的 /health 现在只回「活着」，不泄露账号/曲库信息）
+    apiFetch('/api/status', { timeoutMs: 6000 })
       .then((r) => {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const h = r.json();
@@ -842,7 +974,11 @@ export default function activate(folium) {
         try { folium.ui.toast('汽水音乐：音源服务没起来，看模组面板的日志', { type: 'error', durationMs: 9000 }); } catch (e2) { }
       });
   };
-  probe();
+  // 等服务把端口/密钥/令牌报上来再探活 —— 否则会拿着空密码去打一轮没意义的请求。
+  // 主进程要是没回（旧宿主 / rpc 卡住），4 秒后照样开探，别把启动流程堵死。
+  let probeStarted = false;
+  const startProbe = () => { if (probeStarted) return; probeStarted = true; probe(); };
+  Promise.race([connReady, new Promise((r) => setTimeout(r, 4000))]).then(startProbe, startProbe);
 
   // 激活时如果正在放我们的歌，先备一份逐字歌词
   try {
@@ -852,7 +988,7 @@ export default function activate(folium) {
 
   // 模组被停用 / 重载 / 卸载时，还原我们对宿主做的两处改动
   return () => {
-    disableEndlessFm();
+    disableEndless();
 
     // 把「当前音源」交还给内置音源。
     // 为什么必须做：宿主的 OnlineProviderSwitcher 是 `if (!activeProvider) return null` ——

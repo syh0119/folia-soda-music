@@ -13,10 +13,14 @@
  *
  * 用法：
  *   node soda_subsonic.js                 # 默认 127.0.0.1:4533
- *   PORT=4533 USER=soda PASS=soda node soda_subsonic.js
+ *   PORT=4533 node soda_subsonic.js       # 换端口
  *   node soda_subsonic.js --refresh       # 强制重新从客户端同步登录态
  *
- * Folia 侧配置：设置 → 音源/资料库 → Navidrome → 服务器地址 http://127.0.0.1:4533，用户名/密码见上
+ * 鉴权（见「配置」一节）：用户名固定 soda，密码是启动时生成/读取的随机 SECRET
+ *   · 首次运行会把 SECRET 写进 <数据目录>/auth.json，之后一直用它
+ *   · 控制面 /api/* 另外要一个每次启动随机的 TOKEN（经 rpc 交给模组 client，不落盘）
+ *
+ * Folia 侧配置：设置 → 音源/资料库 → Navidrome → 服务器地址 http://127.0.0.1:4533，密码看启动日志
  */
 'use strict';
 
@@ -32,8 +36,17 @@ const { spawn, execFileSync } = require('child_process');
 // ============================================================ 配置
 const PORT = parseInt(process.env.PORT || '4533', 10);
 const HOST = process.env.HOST || '127.0.0.1';
-const USER = process.env.SUB_USER || process.env.USER || 'soda';
-const PASS = process.env.SUB_PASS || process.env.PASS || 'soda';
+/**
+ * 本机服务的两把钥匙（维护者审查意见：不许再用固定账号 soda/soda）：
+ *   · SECRET —— 数据面（`/rest/*`）的密码。**持久化**在 paths.data/auth.json。
+ *               宿主的 Navidrome 配置里存的就是它 —— 每次启动换一把的话，用户每次都得去改配置。
+ *   · TOKEN  —— 控制面（`/api/*` 与设置页）的令牌。**每次启动随机**，由 main 经 rpc 交给 client，
+ *               不落盘、不写进任何对外 URL。
+ * 用户名保持固定的 'soda'：用户名不是秘密，密码才是。
+ */
+const USER = process.env.SUB_USER || 'soda';
+let SECRET = process.env.SUB_PASS || '';
+let TOKEN = '';
 const APP_ID = '386088';
 const APP_VERSION = '3.8.0';
 const CHANNEL = 'official';
@@ -129,11 +142,81 @@ function sweepCache(force) {
   } catch (e) { }
 }
 
-// ============================================================ 原生模块（延迟加载 + 多路径探测）
+// ============================================================ 原生模块（隔离在子进程里）
 // bdms.node / device.node 都是 N-API 模块（napi_register_module_v1，无 V8/NAN 绑定），
 // 跨 Node / Electron 版本 ABI 稳定，不需要为 Electron 重编译。
-let NATIVE = null, bdms = null, DEVN = null;
+//
+// 但它们是**汽水客户端自带的第三方原生代码**，不属于本模组、也不受模组权限约束。
+// 在主进程里 dlopen 等于把它拉进宿主主进程（同权限 / 同地址空间 / 同崩溃域），
+// 同时还得改主进程的 PATH 与 cwd —— 所以改成**独立子进程**里加载（见 native-host.cjs）。
+// 主进程这一侧只留一个 JSON-RPC 代理，不再碰任何全局状态。
+let NATIVE = null;            // 原生模块目录（仅用于「有没有」判据与日志）
+let host = null;              // 原生宿主子进程
+let hostSeq = 0;
+const hostWaiters = new Map();
 const CORE = require(path.join(LIB, 'luna_core.js'));
+
+const NATIVE_HOST_JS = ['native-host.cjs'].map(f => path.join(ASSET, f))
+  .concat([path.join(ASSET, '..', 'native-host.cjs')])
+  .find(p => { try { return fs.existsSync(p); } catch (e) { return false; } })
+  || path.join(ASSET, 'native-host.cjs');
+
+function hostCall(cmd, args) {
+  if (!host || !host.connected) return Promise.reject(new Error('原生宿主未启动'));
+  const id = ++hostSeq;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      hostWaiters.delete(id);
+      reject(new Error('原生调用超时: ' + cmd));
+    }, 30000);
+    hostWaiters.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+    });
+    try { host.send({ id, cmd, args: args || {} }); }
+    catch (e) { clearTimeout(timer); hostWaiters.delete(id); reject(e); }
+  });
+}
+
+function hostStart(dir) {
+  if (host && host.connected) return Promise.resolve();
+  const { fork } = require('child_process');
+  return new Promise((resolve, reject) => {
+    const env = Object.assign({}, process.env);
+    // Electron 下 fork 出来的默认是**新的应用实例**；带上这个才是纯 Node
+    if (process.versions && process.versions.electron) env.ELECTRON_RUN_AS_NODE = '1';
+    let child;
+    try {
+      child = fork(NATIVE_HOST_JS, [], { env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], windowsHide: true });
+    } catch (e) { return reject(e); }
+    child.stdout.on('data', d => log('[native] ' + String(d).trim()));
+    child.stderr.on('data', d => log('[native:err] ' + String(d).trim()));
+    child.on('message', (m) => {
+      const w = m && hostWaiters.get(m.id);
+      if (!w) return;
+      hostWaiters.delete(m.id);
+      if (m.ok) w.resolve(m.result); else w.reject(new Error(m.error || 'native error'));
+    });
+    const fail = (e) => {
+      const err = e instanceof Error ? e : new Error(String(e));
+      for (const [, w] of hostWaiters) w.reject(err);
+      hostWaiters.clear();
+      if (host === child) host = null;
+    };
+    child.on('error', fail);
+    child.on('exit', (code, sig) => {
+      if (host === child) fail(new Error('原生宿主进程退出 (code=' + code + (sig ? ' signal=' + sig : '') + ')'));
+    });
+    host = child;
+    hostCall('boot', { dir }).then(() => resolve(), (e) => { fail(e); reject(e); });
+  });
+}
+
+function hostStop() {
+  const h = host;
+  host = null;
+  try { h && h.kill(); } catch (e) { }
+}
 
 const hasNative = (d) => {
   try { return fs.existsSync(path.join(d, 'bdms.node')) && fs.existsSync(path.join(d, 'metasecml.dll')); }
@@ -203,17 +286,12 @@ function resolveNativeDir() {
   return null;
 }
 
-function initNative() {
-  if (bdms) return true;
+async function initNative() {
+  if (host && host.connected) return true;
   const dir = resolveNativeDir();
   if (!dir) throw new Error('找不到原生模块：请先安装并运行一次汽水音乐 PC 客户端，或用 SODA_NATIVE_DIR 指定 app.asar.unpacked 目录');
-  log('原生模块目录: ' + dir);
-  process.env.PATH = dir + path.delimiter + (process.env.PATH || '');
-  try { process.chdir(dir); } catch (e) { }   // metasecml.dll 按相对名加载，cwd 得落在这里
-  const load = (p) => { const m = { exports: {} }; process.dlopen(m, p); return m.exports; };
-  bdms = load(path.join(dir, 'bdms.node'));
-  try { DEVN = load(path.join(dir, 'device.node')); }
-  catch (e) { log('device.node 加载失败: ' + e.message); DEVN = null; }
+  log('原生模块目录: ' + dir + '（在独立子进程里加载，主进程不 dlopen 外部原生代码）');
+  await hostStart(dir);
   NATIVE = dir;
   return true;
 }
@@ -235,9 +313,10 @@ let sessHint = '';
 function deviceFile() { return path.join(dataDir(), 'device.json'); }
 
 /** 初始化原生签名器（必须先做，否则 X-Helios/X-Medusa 为空，track_v2 等接口会返回空响应） */
-function initBdms() {
+async function initBdms() {
   try {
-    bdms.init({ deviceId: DEV.did });
+    if (!host) await initNative();
+    await hostCall('init', { deviceId: DEV.did });
     log('签名器已初始化 deviceId=' + DEV.did);
     return true;
   } catch (e) { log('签名器初始化失败: ' + e.message); return false; }
@@ -266,8 +345,9 @@ function postRaw(host, p, headers, body) {
 /** 复刻客户端 device 注册：gzip(payload) → applogDecorated → POST */
 async function registerDevice() {
   const cdid = crypto.randomUUID();
+  if (!host) await initNative();
   let serial = '';
-  try { serial = String(DEVN.getSerial() || '').replace(/\0+$/, ''); } catch (e) { }
+  try { serial = String(await hostCall('serial')); } catch (e) { }
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
   const payload = {
     header: {
@@ -282,7 +362,9 @@ async function registerDevice() {
     },
     gen_time: Date.now(), magic_tag: 'ss_app_log',
   };
-  const decorated = DEVN.applogDecorated(zlib.gzipSync(Buffer.from(JSON.stringify(payload))));
+  const decorated = Buffer.from(
+    (await hostCall('decorate', { b64: zlib.gzipSync(Buffer.from(JSON.stringify(payload))).toString('base64') })).b64,
+    'base64');
   const qs = Object.entries({ aid: APP_ID, channel: CHANNEL, os: os.type(), os_version: os.version(), device_platform: 'PC', app_version: APP_VERSION })
     .map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
   const r = await postRaw('api.qishui.com', '/service/2/desktop/device_register/?' + qs,
@@ -327,7 +409,7 @@ function trySessionFromJson() {
       const cookie = j.cookie || Object.entries(j.cookieMap || {}).map(([k, v]) => k + '=' + v).join('; ');
       if (!cookie) continue;
       COOKIE = cookie;
-      fs.writeFileSync(path.join(dataDir(), '_session.txt'), cookie);
+      saveSessionCookie(cookie);
       sessHint = '来自 _pc_cookie.json · ' + cookie.length + ' 字符';
       log('已从 _pc_cookie.json 载入登录态（' + p + '）');
       return true;
@@ -388,7 +470,7 @@ async function refreshSessionFromClient() {
   for (const r of rows) if (r.host_key === '.qishui.com') ck[r.name] = r.value || dec(r.encrypted_value);
   if (!ck.sessionid) throw new Error('未找到 sessionid（客户端里还没登录？）');
   const cookie = Object.entries(ck).map(([k, v]) => k + '=' + v).join('; ');
-  fs.writeFileSync(path.join(dataDir(), '_session.txt'), cookie);
+  saveSessionCookie(cookie);
   COOKIE = cookie;
   sessHint = 'sessionid ' + String(ck.sessionid).slice(0, 10) + '… 共 ' + Object.keys(ck).length + ' 项';
   log('已从客户端同步登录态 sessionid=' + String(ck.sessionid).slice(0, 10) + '…');
@@ -411,10 +493,85 @@ function sweepTempCookies() {
   } catch (e) { }
 }
 
+/**
+ * 登录态的落盘与读取。
+ * -----------------------------------------------------------------------------
+ * 维护者审查意见：**登录态不要明文落盘**。这里改成用宿主（Electron）的 `safeStorage`
+ * 加密后再写盘 —— Windows 上它走 DPAPI，密钥绑当前用户账户，别的程序/账户拿到文件也解不开。
+ *
+ * 拿不到 safeStorage（纯 Node 独立运行、或系统不支持）时**不落盘**：
+ * 宁可在启动时多同步一次（要求汽水客户端退出），也不在磁盘上留一份明文 cookie。
+ * 顺带清掉旧版本写的 `_session.txt`。
+ */
+function sessionFile() { return path.join(dataDir(), '_session.bin'); }
+
+function safeStore() {
+  try {
+    const { safeStorage } = require('electron');
+    if (safeStorage && safeStorage.isEncryptionAvailable && safeStorage.isEncryptionAvailable()) return safeStorage;
+  } catch (e) { }
+  return null;
+}
+
+function saveSessionCookie(cookie) {
+  // 旧的明文文件一律删掉（不管这次能不能加密，都不该留在那里）
+  try { fs.rmSync(path.join(dataDir(), '_session.txt'), { force: true }); } catch (e) { }
+  const ss = safeStore();
+  if (!ss) { log('未启用加密存储（safeStorage 不可用），本次登录态只留在内存里，不落盘'); return false; }
+  try {
+    fs.writeFileSync(sessionFile(), ss.encryptString(cookie), { mode: 0o600 });
+    return true;
+  } catch (e) { log('登录态加密落盘失败: ' + e.message); return false; }
+}
+
 function loadSession() {
-  const p = path.join(dataDir(), '_session.txt');
-  if (fs.existsSync(p)) { COOKIE = fs.readFileSync(p, 'utf8').trim(); sessHint = COOKIE.length + ' 字符（' + new Date(fs.statSync(p).mtime).toLocaleString('zh-CN') + '）'; }
+  try { fs.rmSync(path.join(dataDir(), '_session.txt'), { force: true }); } catch (e) { }
+  const p = sessionFile();
+  if (!fs.existsSync(p)) return COOKIE;
+  const ss = safeStore();
+  if (!ss) return COOKIE;
+  try {
+    COOKIE = String(ss.decryptString(fs.readFileSync(p)) || '').trim();
+    sessHint = COOKIE.length + ' 字符（加密存储 · ' + new Date(fs.statSync(p).mtime).toLocaleString('zh-CN') + '）';
+  } catch (e) { log('登录态解密失败（换过用户/账户？）：' + e.message); }
   return COOKIE;
+}
+
+/** 清掉旧版本留下的明文数据目录（%APPDATA%\luna_export）。
+ *  · 先**迁移**设备身份（device.json）：它只是一个随机的 did/iid，没必要让用户重新注册一台设备。
+ *  · 登录态（_session.txt）是明文，不迁移，直接删 —— 重启后重新同步一次即可。
+ *  · 只在旧目录**不是**当前数据目录时才动，免得把正在用的数据删掉。 */
+function cleanLegacyLayout() {
+  try {
+    const legacy = path.join(APPDATA, 'luna_export');
+    const legacySoda = path.join(legacy, 'soda');
+    const cur = path.resolve(dataDir());
+    const inside = (p) => { const r = path.resolve(p); return r === cur || r.startsWith(cur + path.sep); };
+    if (inside(legacy) || inside(legacySoda)) return;
+    if (!fs.existsSync(legacySoda) && !fs.existsSync(path.join(legacy, 'device.json'))) return;
+
+    // 迁移设备身份
+    const srcDevice = fs.existsSync(path.join(legacySoda, 'device.json'))
+      ? path.join(legacySoda, 'device.json') : path.join(legacy, 'device.json');
+    const dstDevice = deviceFile();
+    if (!fs.existsSync(dstDevice) && fs.existsSync(srcDevice)) {
+      try {
+        fs.mkdirSync(path.dirname(dstDevice), { recursive: true });
+        fs.copyFileSync(srcDevice, dstDevice);
+        log('已把旧数据目录里的设备身份迁移到新的数据目录');
+      } catch (e) { }
+    }
+
+    let n = 0;
+    for (const t of [legacySoda, path.join(legacy, 'device.json')]) {
+      try {
+        if (!fs.existsSync(t)) continue;
+        fs.rmSync(t, { recursive: true, force: true });
+        n++;
+      } catch (e) { }
+    }
+    if (n) log('已清理旧版明文数据目录 ' + legacy);
+  } catch (e) { }
 }
 
 let _resyncing = null;
@@ -439,18 +596,20 @@ function baseQuery() {
 function buildUrl(p) {
   return API + p + '?' + Object.entries(baseQuery()).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
 }
-function signedHeaders(url, extra, body) {
+/** 加签。签名器住在子进程里，所以这里改成异步（调用点都要 await）。 */
+async function signedHeaders(url, extra, body) {
+  if (!host) await initNative();
   const h = { 'user-agent': UA, ...extra };
   if (COOKIE) h['cookie'] = COOKIE;
   if (body) h['x-ss-stub'] = crypto.createHash('md5').update(body).digest('hex').toUpperCase();
   const lines = Object.entries(h).map(([k, v]) => k + '\r\n' + v).join('\r\n');
-  const parts = String(bdms.generateHttpSignatureHeaders(url, lines)).split('\r\n').filter(t => t.trim());
+  const parts = String(await hostCall('sign', { url, lines })).split('\r\n').filter(t => t.trim());
   for (let i = 0; i < parts.length / 2; i++) h[parts[i * 2]] = parts[i * 2 + 1];
   return h;
 }
 function req(url, { method = 'GET', headers = {}, body = null } = {}) {
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
+    const u = assertFetchable(url);   // 上游返回的播放地址也先过一遍 https/公网校验
     const r = https.request({ hostname: u.hostname, path: u.pathname + u.search, method, headers }, res => {
       const c = []; res.on('data', x => c.push(x));
       res.on('end', () => resolve({ status: res.statusCode, buf: Buffer.concat(c) }));
@@ -465,12 +624,12 @@ const reqJson = async (url, opt) => JSON.parse((await req(url, opt)).buf.toStrin
 async function rpcPostOnce(p, body) {
   const url = buildUrl(p);
   const b = body === undefined ? null : JSON.stringify(body);
-  const headers = signedHeaders(url, { 'content-type': 'application/json; charset=utf-8' }, b);
+  const headers = await signedHeaders(url, { 'content-type': 'application/json; charset=utf-8' }, b);
   return reqJson(url, { method: 'POST', headers, body: b });
 }
 async function rpcGetOnce(p, extra) {
   const url = buildUrl(p) + (extra ? '&' + Object.entries(extra).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&') : '');
-  return reqJson(url, { method: 'GET', headers: signedHeaders(url, {}) });
+  return reqJson(url, { method: 'GET', headers: await signedHeaders(url, {}) });
 }
 /** 登录态失效（1000016）时自动重同步一次再重试 */
 async function rpcPost(p, body) {
@@ -483,10 +642,42 @@ async function rpcGet(p, extra) {
   if (j && j.status_code === 1000016) { await tryResync('1000016'); return rpcGetOnce(p, extra); }
   return j;
 }
+/** 本机 / 内网地址判定：SSRF 的最后一道闸。CDN 重定向也不能把我们带到内网去。 */
+function isPrivateHost(hostname) {
+  const h = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) {
+    const p = h.split('.').map(Number);
+    return p[0] === 0 || p[0] === 10 || p[0] === 127
+      || (p[0] === 169 && p[1] === 254)
+      || (p[0] === 172 && p[1] >= 16 && p[1] <= 31)
+      || (p[0] === 192 && p[1] === 168)
+      || p[0] >= 224;
+  }
+  if (h.includes(':')) {
+    return h === '::' || h === '::1' || h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd');
+  }
+  return false;
+}
+
+/** 只允许 https + 公网主机 + 443 端口 */
+function assertFetchable(url) {
+  let u;
+  try { u = new URL(String(url)); } catch (e) { throw new Error('bad url'); }
+  if (u.protocol !== 'https:') throw new Error('只允许 https: ' + u.protocol);
+  if (isPrivateHost(u.hostname)) throw new Error('拒绝访问本机/内网地址: ' + u.hostname);
+  if (u.port && u.port !== '443') throw new Error('只允许 443 端口');
+  return u;
+}
+
 function getBuf(url, extraHeaders, maxRedirect = 5) {
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    https.get({ hostname: u.hostname, path: u.pathname + u.search, headers: { 'user-agent': UA, ...(extraHeaders || {}) } }, res => {
+    const u = assertFetchable(url);   // 每一跳都校验，重定向绕不过去
+    // 超时兜底：汽水的封面 CDN 偶尔会「连上了但不回数据」（尤其 douyinpic 那批）。
+    // 没有超时的话这个 Promise 永不 settle → getCoverArt 永不响应 → Folia 那张 <img>
+    // 就一直停在 pending，界面上就是一块**纯空白**（既没有破图图标，也没有占位图）。
+    const req = https.get({ hostname: u.hostname, path: u.pathname + u.search, timeout: 12000, headers: { 'user-agent': UA, ...(extraHeaders || {}) } }, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && maxRedirect > 0) {
         res.resume();
         const loc = new URL(res.headers.location, url).toString();
@@ -495,15 +686,18 @@ function getBuf(url, extraHeaders, maxRedirect = 5) {
       if (res.statusCode !== 200) { res.resume(); return reject(new Error('HTTP ' + res.statusCode)); }
       const chunks = []; res.on('data', c => chunks.push(c));
       res.on('end', () => resolve(Buffer.concat(chunks)));
-    }).on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
   });
 }
 
 /** track_v2 → 原始 track 元数据 + 歌词 + 各档位流信息 */
 async function trackV2(trackId) {
+  trackId = safeTrackId(trackId);
   const body = JSON.stringify({ track_id: String(trackId), media_type: 'track', queue_type: 'daily_mix', scene_name: 'track_reco' });
   const url = buildUrl('/luna/pc/track_v2');
-  const headers = signedHeaders(url, { 'content-type': 'application/json; charset=utf-8' }, body);
+  const headers = await signedHeaders(url, { 'content-type': 'application/json; charset=utf-8' }, body);
   const j = await reqJson(url, { method: 'POST', headers, body });
   const tr = j.track, tp = j.track_player;
   if (!tr) throw new Error('track_v2 无 track');
@@ -524,6 +718,7 @@ async function trackV2(trackId) {
  * 绝不走 ensureAudio —— 那会顺带下载并解密整首歌（无损 25MB，2–5 秒），预取等不起。
  */
 async function fetchLyricOnly(trackId) {
+  trackId = safeTrackId(trackId);
   const f = path.join(lyricDir(), trackId + '.txt');
   if (fs.existsSync(f)) return fs.readFileSync(f, 'utf8');
   const metaFile = path.join(cacheDir(), trackId + '.json');
@@ -574,13 +769,16 @@ function rawCoverOf(tr) {
 
 /** 取流 + 解密 + 落盘缓存 */
 async function ensureAudio(trackId) {
+  trackId = safeTrackId(trackId);
   const metaFile = path.join(cacheDir(), trackId + '.json');
   const hit = fs.existsSync(metaFile) ? JSON.parse(fs.readFileSync(metaFile, 'utf8')) : null;
   if (hit && fs.existsSync(path.join(cacheDir(), hit.file))) return hit;
 
   const { track, lyric, translations, items } = await trackV2(trackId);
   const pick = pickItem(items);
-  const key = DEVN.decodeSpade(pick.spade_a);
+  const kr = await hostCall('decodeSpade', { spade: pick.spade_a });
+  // decrypt() 要的是 hex 字符串；原生模块正常回字符串，万一回 Buffer 就按 latin1 还原
+  const key = kr.kind === 'string' ? kr.text : Buffer.from(kr.b64, 'base64').toString('latin1');
   let coverBuf = null;
   const cu = coverUrlOf(track);
   if (cu) { try { coverBuf = await getBuf(cu); } catch (e) { } }
@@ -857,7 +1055,8 @@ async function refreshCatalog(force) {
           continue;
         }
         const ts = await v.load();
-        // 封面取列表里第一首的封面（Folia 侧：coverArt 为空就画占位图标）
+        // 封面取列表里第一首的封面；都没有就留空 —— 空串时 Folia 会画「名字首字母」占位图，
+        // 比硬塞一个取不到的 id（→ 破图）好得多
         pls.push({ id: v.id, name: v.name, count: ts.length, cover: (ts[0] && ts[0].cover) || '', virtual: true, tracks: ts });
       } catch (e) { log('来源失败 ' + v.name + ': ' + e.message); }
     }
@@ -935,36 +1134,193 @@ function ok(extra) {
 function failed(code, msg) { return { status: 'failed', version: SUBSONIC_VERSION, error: { code: code || 0, message: msg || 'error' } }; }
 
 function md5(s) { return crypto.createHash('md5').update(s).digest('hex'); }
+/** 恒定时间比较，避免用字符串比较泄露长度/前缀 */
+function timingEq(a, b) {
+  const x = Buffer.from(String(a), 'utf8');
+  const y = Buffer.from(String(b), 'utf8');
+  if (x.length !== y.length) return false;
+  try { return crypto.timingSafeEqual(x, y); } catch (e) { return false; }
+}
+
+/** 数据面密钥的持久化文件（落在宿主给的 paths.data 里，权限 0600） */
+function authFile() { return path.join(dataDir(), 'auth.json'); }
+
+/** 读取/生成数据面密钥（`/rest/*` 的密码）。
+ *  **必须持久**：宿主的 Navidrome 配置里存的就是它，每次启动换一把会让用户每次都要重填。 */
+function loadSecret() {
+  if (SECRET) return SECRET;
+  try {
+    const j = JSON.parse(fs.readFileSync(authFile(), 'utf8'));
+    if (j && typeof j.secret === 'string' && j.secret.length >= 16) { SECRET = j.secret; return SECRET; }
+  } catch (e) { }
+  SECRET = crypto.randomBytes(24).toString('base64url');
+  try {
+    fs.writeFileSync(authFile(), JSON.stringify({ secret: SECRET, createdAt: new Date().toISOString() }, null, 1), { mode: 0o600 });
+    log('已生成本机服务密钥 auth.json（只允许当前用户读取）');
+  } catch (e) { log('密钥落盘失败（本次运行仍可用，重启后会变）: ' + e.message); }
+  return SECRET;
+}
+
+/** Subsonic 认证：用户名固定 `soda`，密码是随机 SECRET；控制面 TOKEN 也接受（方便本机调试）。 */
 function checkAuth(q) {
-  const u = q.u || '';
-  if (PASS === '' ) return u === USER || !u;
-  if (q.p !== undefined && q.p !== null && q.p !== '') return u === USER && q.p === PASS;
+  if (String(q.u || '') !== USER) return false;
+  const p = q.p;
+  if (p !== undefined && p !== null && p !== '') {
+    return timingEq(p, SECRET) || (!!TOKEN && timingEq(p, TOKEN));
+  }
   const salt = q.s || '';
   if (!salt || !q.t) return false;
-  return u === USER && md5(PASS + salt).toLowerCase() === String(q.t).toLowerCase();
+  const t = String(q.t).toLowerCase();
+  return timingEq(t, md5(SECRET + salt).toLowerCase())
+    || (!!TOKEN && timingEq(t, md5(TOKEN + salt).toLowerCase()));
+}
+
+/** 封面 id 只允许指向汽水自家的图片 CDN。
+ *  维护者审查意见：`getCoverArt` 不能变成「请求任意 http 地址」的跳板 ——
+ *  所以这里做白名单，白名单外的 id 一律落到占位图，不发请求。 */
+const COVER_HOSTS = ['douyinpic.com', 'douyincdn.com', 'byteimg.com', 'bytedance.com', 'qishui.com', 'qishuimusic.com'];
+function isAllowedCoverUrl(v) {
+  try {
+    const u = new URL(String(v));
+    if (u.protocol !== 'https:') return false;
+    const h = u.hostname.toLowerCase();
+    return COVER_HOSTS.some(d => h === d || h.endsWith('.' + d));
+  } catch (e) { return false; }
+}
+
+/** 曲目 id 只收数字。
+ *  它会直接拼进缓存文件名（`<id>.json` / `<id>.flac`），所以必须挡住 `../`、`/`、`:` 之类。 */
+function safeTrackId(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!/^\d{1,32}$/.test(s)) throw { code: 70, message: 'invalid song id' };
+  return s;
 }
 
 function songOf(t) {
+  // 封面：**永不为空**。Folia 只有首页那 4 个列表位会把空串兜成 uN 占位图，
+  // 墙（Bravais）和歌手详情头图是直接渲染 coverUrl 的 —— 空串 = 那块纯空白。
+  // 所以这里一路兜到「占位 id」，由 getCoverArt 现画一张带名字的 SVG。
   return {
     id: t.id, parent: t.albumId || '0', isDir: false, title: t.name, album: t.album || '',
-    artist: t.artists.join(' / '), track: 0, year: 0, genre: '', coverArt: t.cover || (t.albumId || t.id),
+    artist: t.artists.join(' / '), track: 0, year: 0, genre: '', coverArt: coverOrPlaceholder(t),
     size: 0, contentType: 'audio/flac', suffix: 'flac', duration: Math.round(((t.duration || 0) || 0) / 1000),
     created: new Date().toISOString(), albumId: t.albumId || '', artistId: t.artistIds[0] || '',
     type: 'music', isVideo: false, path: t.name,
   };
 }
+function firstArtistId(a) {
+  for (const id of a.trackIds || []) {
+    const t = CATALOG.tracks.get(id);
+    if (t && t.artistIds && t.artistIds[0]) return t.artistIds[0];
+  }
+  return '';
+}
+// 专辑里到底有没有一张能用的封面？决定 coverArt 给 id 还是给空串（见 songOf 注释）。
+// 沿目录版本做 memo，避免每首歌都扫一遍全曲库。
+let _albCoverAt = 0;
+let _albCoverN = -1;
+let _albCover = new Map();
+function albumHasCover(albumId) {
+  if (!albumId) return false;
+  if (_albCoverAt !== CATALOG.loadedAt || _albCoverN !== CATALOG.tracks.size) {
+    _albCoverAt = CATALOG.loadedAt; _albCoverN = CATALOG.tracks.size; _albCover = new Map();
+  }
+  let v = _albCover.get(albumId);
+  if (v === undefined) {
+    const a = CATALOG.albums.get(albumId);
+    v = !!(a && a.cover) || [...CATALOG.tracks.values()].some(x => x.albumId === albumId && x.cover);
+    _albCover.set(albumId, v);
+  }
+  return v;
+}
+
+/** 占位封面 id：`ph:<名字>` → getCoverArt 现画一张「名字前两字 + 渐变」的 SVG。
+ *  必要性：Folia 的墙（Bravais）与歌手详情头图是**直接拿 coverUrl 渲染**的，
+ *  不走 uN 占位（uN 只用在首页那 4 个列表位）。coverArt 留空 = 那块就是纯空白。 */
+const PH_PREFIX = 'ph:';
+function phId(name) { return PH_PREFIX + String(name || '').trim(); }
+
+/** 曲库里找一张**同名**曲目的封面（同一首歌的其它版本），零请求 */
+let _nameCoverAt = 0;
+let _nameCoverN = -1;
+let _nameCover = new Map();
+function sameNameCover(name) {
+  const n = String(name || '').trim();
+  if (!n) return '';
+  if (_nameCoverAt !== CATALOG.loadedAt || _nameCoverN !== CATALOG.tracks.size) {
+    _nameCoverAt = CATALOG.loadedAt; _nameCoverN = CATALOG.tracks.size; _nameCover = new Map();
+  }
+  let v = _nameCover.get(n);
+  if (v === undefined) {
+    const hit = [...CATALOG.tracks.values()].find(x => x.cover && x.name === n);
+    v = hit ? hit.cover : '';
+    _nameCover.set(n, v);
+  }
+  return v;
+}
+
+/** 一张**永不为空**的封面值：真封面 URL > 同名曲封面 > 专辑 id > 占位 id */
+function coverOrPlaceholder(t) {
+  if (!t) return '';
+  return t.cover
+    || (albumHasCover(t.albumId) ? t.albumId : '')
+    || sameNameCover(t.name)
+    || phId(t.name);
+}
+
+/** 专辑卡的封面值（**永不为空**）：自身封面 > 曲库里有封面的专辑 id > 占位 id。
+ *  坑：专辑 id 可能是 '0'（Subsonic 的「无专辑」哨兵，本曲库里显示为「未知专辑」，一个人占 57 首）。
+ *  Folia 把 '0' 当「没有」处理（parent/coverArt 的根 id 语义），所以 '0' 一律不发，直接落到占位图。 */
+function albumCoverValue(albumId, name, ownCover) {
+  if (ownCover) return ownCover;
+  const a = albumId ? CATALOG.albums.get(albumId) : null;
+  if (a && a.cover) return a.cover;
+  if (albumId && albumId !== '0' && albumHasCover(albumId)) return albumId;
+  return phId(name || (a && a.name) || '');
+}
 function albumOf(a) {
   return {
-    id: a.id, name: a.name, artist: a.artist || '未知歌手', artistId: '', coverArt: a.cover || a.id,
+    id: a.id, name: a.name, artist: a.artist || '未知歌手', artistId: firstArtistId(a),
+    coverArt: albumCoverValue(a.id, a.name, a.cover),
     songCount: a.trackIds.length, duration: 0, created: new Date().toISOString(), playCount: 0,
     song: a.trackIds.slice(0, 500).map(id => CATALOG.tracks.get(id)).filter(Boolean).map(songOf),
   };
+}
+
+// 歌手的专辑数 / 头像 / 专辑列表：要从目录里反查，逐首扫太贵 → 按目录版本做一层 memo
+// （catalogAdd 会随时加曲目而 loadedAt 不变，所以 tracks.size 也要一起当版本号）
+let _arMetaAt = 0;
+let _arMetaN = -1;
+let _arMeta = new Map();
+function artistMeta(a) {
+  if (_arMetaAt !== CATALOG.loadedAt || _arMetaN !== CATALOG.tracks.size) {
+    _arMetaAt = CATALOG.loadedAt; _arMetaN = CATALOG.tracks.size; _arMeta = new Map();
+  }
+  let m = _arMeta.get(a.id);
+  if (m) return m;
+  const albumIds = [];
+  const seen = new Set();
+  let cover = '';
+  for (const id of a.trackIds || []) {
+    const t = CATALOG.tracks.get(id);
+    if (!t) continue;
+    if (!cover && t.cover) cover = t.cover;          // 头像是在线 URL，直接给 Folia 用
+    if (t.albumId && !seen.has(t.albumId)) { seen.add(t.albumId); albumIds.push(t.albumId); }
+  }
+  m = { albumIds, cover };
+  _arMeta.set(a.id, m);
+  return m;
+}
+/** 列表用的歌手摘要 */
+function artistBrief(a) {
+  const m = artistMeta(a);
+  return { id: a.id, name: a.name, albumCount: m.albumIds.length, coverArt: m.cover || phId(a.name) };
 }
 function playlistOf(p) {
   return {
     id: p.id, name: p.name, comment: '', owner: USER, public: false, songCount: p.count || 0,
     duration: 0, created: new Date().toISOString(), changed: new Date().toISOString(),
-    coverArt: p.cover || ((p.tracks && p.tracks[0] && p.tracks[0].cover) || ''), entry: (p.tracks || []).map(songOf),
+    coverArt: p.cover || ((p.tracks && p.tracks[0] && p.tracks[0].cover) || '') || phId(p.name), entry: (p.tracks || []).map(songOf),
   };
 }
 
@@ -1043,22 +1399,45 @@ const ROUTES = {
     return { song: songOf(t) };
   },
 
-  getArtists: async () => {
+  getArtists: async (q) => {
     await refreshCatalog();
+    // 支持 offset/size 翻页（Folia 歌手页无限滚动）：不传 offset 时返回全部
+    const offset = Math.max(0, parseInt(q.offset || '0', 10) || 0);
+    const size = Math.max(1, parseInt(q.size || '0', 10) || 500);
     let list = [...CATALOG.artists.values()];
     if (MIN_ARTIST_TRACKS > 1) list = list.filter(a => (a.trackIds || []).length >= MIN_ARTIST_TRACKS);
     list = list.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
-    const idx = [{ name: '#', artist: [] }];
-    for (const a of list) idx[0].artist.push({ id: a.id, name: a.name, albumCount: 0, coverArt: '' });
+    const idx = [{ name: '#', artist: list.slice(offset, offset + size).map(artistBrief) }];
     return { artists: { ignoredArticles: 'The El La Los Las Le Les', index: idx } };
   },
   getArtist: async (q) => {
     await refreshCatalog();
     const a = CATALOG.artists.get(q.id);
     if (!a) throw { code: 70, message: 'artist not found' };
-    return { artist: { id: a.id, name: a.name, albumCount: 0, album: [], song: a.trackIds.slice(0, 500).map(id => CATALOG.tracks.get(id)).filter(Boolean).map(songOf) } };
+    const m = artistMeta(a);
+    const albums = m.albumIds.map(id => CATALOG.albums.get(id)).filter(Boolean).map(x => {
+      const o = albumOf(x);
+      delete o.song;                 // 歌手页只要专辑卡，曲目另走 getAlbum
+      return o;
+    });
+    return {
+      artist: {
+        id: a.id, name: a.name, albumCount: albums.length, coverArt: m.cover || phId(a.name),
+        album: albums,
+        song: a.trackIds.slice(0, 500).map(id => CATALOG.tracks.get(id)).filter(Boolean).map(songOf),
+      },
+    };
   },
-  getArtistInfo2: async (q) => ({ artistInfo2: { biography: '', similarArtist: [] } }),
+  getArtistInfo2: async (q) => {
+    await refreshCatalog();
+    const a = CATALOG.artists.get(q.id);
+    // Folia 的歌手页头像走这三个字段；**始终填**，没有真封面就给占位 id（现画带名字的 SVG），
+    // 否则「没有封面的歌手」在这里会拿到空串 → 头图那块就是纯空白。
+    const cov = (a ? artistMeta(a).cover : '') || phId(a ? a.name : '');
+    const info = { biography: '', similarArtist: [] };
+    info.smallImageUrl = cov; info.mediumImageUrl = cov; info.largeImageUrl = cov;
+    return { artistInfo2: info };
+  },
 
   getRandomSongs: async (q) => {
     await refreshCatalog();
@@ -1067,13 +1446,32 @@ const ROUTES = {
     return { randomSongs: { song: all.map(songOf) } };
   },
 
-  getStarred2: async () => {
+  getStarred2: async (q) => {
     await refreshCatalog();
     // 「我喜欢的音乐」直接映射为收藏
     const liked = CATALOG.playlists.find(p => /我喜欢的音乐/.test(p.name));
     let ts = [];
     if (liked) { try { ts = await playlistTracks(liked); } catch (e) { } }
-    return { starred2: { song: ts.map(songOf), album: [], artist: [] } };
+    // 分页只作用于歌曲（Folia 的收藏页按歌曲滚动）；专辑/歌手是全量小列表
+    const offset = Math.max(0, parseInt(q.offset || '0', 10) || 0);
+    const size = Math.max(1, parseInt(q.size || '0', 10) || 500);
+    const seenA = new Set(); const seenR = new Set();
+    const albs = []; const ars = [];
+    for (const t of ts) {
+      if (t.albumId && !seenA.has(t.albumId)) {
+        seenA.add(t.albumId);
+        const al = CATALOG.albums.get(t.albumId);
+        if (al) { const o = albumOf(al); delete o.song; albs.push(o); }
+        else albs.push({ id: t.albumId, name: t.album || '', artist: (t.artists || [])[0] || '', artistId: (t.artistIds || [])[0] || '', coverArt: albumCoverValue(t.albumId, t.album || (t.artists || [])[0], t.cover), songCount: 0, duration: 0, created: '' });
+      }
+      (t.artistIds || []).forEach((aid, i) => {
+        if (!aid || seenR.has(aid)) return;
+        seenR.add(aid);
+        const ar = CATALOG.artists.get(aid);
+        ars.push(ar ? artistBrief(ar) : { id: aid, name: (t.artists || [])[i] || '', albumCount: 0, coverArt: phId((t.artists || [])[i]) });
+      });
+    }
+    return { starred2: { song: ts.slice(offset, offset + size).map(songOf), album: albs, artist: ars } };
   },
   star: async () => { throw { code: 0, message: '收藏请到「我喜欢的音乐」歌单里操作' }; },
   unstar: async () => { throw { code: 0, message: '收藏请到「我喜欢的音乐」歌单里操作' }; },
@@ -1113,8 +1511,16 @@ const ROUTES = {
     const albs = []; const ars = [];
     const seenA = new Set(), seenR = new Set();
     for (const s of songs) {
-      if (s.albumId && !seenA.has(s.albumId)) { seenA.add(s.albumId); albs.push({ id: s.albumId, name: s.album, artist: s.artists[0] || '', coverArt: s.cover, songCount: 0, duration: 0, created: '' }); }
-      (s.artistIds || []).forEach((aid, i) => { if (aid && !seenR.has(aid)) { seenR.add(aid); ars.push({ id: aid, name: s.artists[i], albumCount: 0, coverArt: '' }); } });
+      if (s.albumId && !seenA.has(s.albumId)) {
+        seenA.add(s.albumId);
+        albs.push({ id: s.albumId, name: s.album, artist: s.artists[0] || '', artistId: (s.artistIds || [])[0] || '', coverArt: albumCoverValue(s.albumId, s.album || s.artists[0], s.cover), songCount: 0, duration: 0, created: '' });
+      }
+      (s.artistIds || []).forEach((aid, i) => {
+        if (!aid || seenR.has(aid)) return;
+        seenR.add(aid);
+        const ar0 = CATALOG.artists.get(aid);   // 目录里有的（本地回退/热过）就带上头像与专辑数
+        ars.push(ar0 ? artistBrief(ar0) : { id: aid, name: s.artists[i], albumCount: 0, coverArt: s.cover || phId(s.artists[i]) });
+      });
     }
     return { searchResult3: { artist: ars, album: albs, song: songs.map(songOf) } };
   },
@@ -1171,11 +1577,14 @@ const ROUTES = {
     // 之前忽略了 size，一律回 800×800，几百张卡片一起渲染时 GPU 会被拖死。
     const size = parseInt(q.size || '0', 10);
     const px = size >= 64 ? Math.min(size, 1200) : 800;
+    // 占位 id：现画一张带名字的 SVG，不进 jpg 缓存（同一 id 不同名字没法复用）
+    if (id && id.startsWith(PH_PREFIX)) return sendPlaceholder(res, id.slice(PH_PREFIX.length), px);
     const f = path.join(cacheDir(), 'cover_' + md5(id + '@' + px) + '.jpg');
     if (fs.existsSync(f)) return sendImage(res, fs.readFileSync(f));
     const t = CATALOG.tracks.get(id) || [...CATALOG.tracks.values()].find(x => x.albumId === id);
-    const base = (t && t.cover) || (id.startsWith('http') ? id : '');
-    if (!base) { res.writeHead(404); res.end('no cover'); return undefined; }
+    // 只认「曲目自带的封面」或「白名单 CDN 上的链接」；其它一律走占位图，绝不代发请求
+    const base = (t && t.cover) || (isAllowedCoverUrl(id) ? id : '');
+    if (!base) return sendPlaceholder(res, coverLabel(id), px);
     try {
       const b = await getBuf(resizeCoverUrl(base, px));
       fs.writeFileSync(f, b);
@@ -1186,11 +1595,13 @@ const ROUTES = {
         const b2 = await getBuf(base);
         fs.writeFileSync(f, b2);
         return sendImage(res, b2);
-      } catch (e2) { res.writeHead(404); res.end('cover fetch failed'); return undefined; }
+      } catch (e2) { return sendPlaceholder(res, coverLabel(id), px); }   // CDN 挂了也别破图
     }
   },
   stream: async (q, res, reqObj) => {
     const m = await ensureAudio(q.id);
+    // 缓存文件名是我们自己写的（<id>.<ext>）；这里再挡一道，别让被篡改的 meta 把路径带出去
+    if (!/^\d{1,32}\.[A-Za-z0-9]{1,8}$/.test(String(m.file || ''))) throw { code: 70, message: 'bad cache entry' };
     const file = path.join(cacheDir(), m.file);
     const stat = fs.statSync(file);
     const type = m.ext === '.flac' ? 'audio/flac' : (m.ext === '.m4a' ? 'audio/mp4' : 'application/octet-stream');
@@ -1204,12 +1615,12 @@ const ROUTES = {
       res.writeHead(206, {
         'Content-Type': type, 'Accept-Ranges': 'bytes',
         'Content-Range': 'bytes ' + start + '-' + end + '/' + stat.size,
-        'Content-Length': end - start + 1, 'Access-Control-Allow-Origin': '*',
+        'Content-Length': end - start + 1,
       });
       fs.createReadStream(file, { start, end }).pipe(res);
       return undefined;
     }
-    res.writeHead(200, { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Length': stat.size, 'Access-Control-Allow-Origin': '*' });
+    res.writeHead(200, { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Length': stat.size });
     fs.createReadStream(file).pipe(res);
     return undefined;
   },
@@ -1332,38 +1743,97 @@ function enhancedLrcFrom(raw) {
   }).join('\n');
 }
 function sendImage(res, buf) {
-  res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'Cache-Control': 'max-age=86400', 'Access-Control-Allow-Origin': '*' });
+  res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'Cache-Control': 'max-age=86400' });
   res.end(buf);
   return undefined;   // 关键：不要返回 res，否则外层会再尝试 emit JSON
 }
 
+/** 取封面用不到的兜底：现画一张 SVG 占位图，别回 404。
+ *  为什么不用 404 让 Folia 自己兜底：Folia 只在 **coverArt 为空**时才画 uN(name) 占位图；
+ *  一旦它手里已经有 URL，取图失败就是破图/空白 —— 这条路只有服务端能救。 */
+function coverLabel(id) {
+  const t = CATALOG.tracks.get(id);
+  if (t) return t.name;
+  const a = CATALOG.albums.get(id);
+  if (a) return a.name;
+  const ar = CATALOG.artists.get(id);
+  if (ar) return ar.name;
+  return '';
+}
+function placeholderSvg(label, px) {
+  // 取前两个字，与 Folia 自带占位图（uN）的取名规则一致
+  const raw = String(label || '').trim();
+  const txt = raw ? Array.from(raw).slice(0, 2).join('') : '♪';
+  const esc = txt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const size = Math.min(Math.max(px || 600, 64), 1200);
+  const fs = txt.length > 1 ? 30 : 42;
+  return Buffer.from(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="' + size + '" height="' + size + '" viewBox="0 0 100 100">' +
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">' +
+    '<stop offset="0" stop-color="#e0f2fe"/><stop offset="1" stop-color="#bae6fd"/></linearGradient></defs>' +
+    '<rect width="100" height="100" fill="url(#g)"/>' +
+    '<text x="50" y="50" font-size="' + fs + '" text-anchor="middle" dominant-baseline="central" ' +
+    'fill="#0f3a5b" font-family="system-ui,-apple-system,Segoe UI,sans-serif">' + esc + '</text></svg>', 'utf8');
+}
+function sendPlaceholder(res, label, px) {
+  const buf = placeholderSvg(label, px);
+  res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Content-Length': buf.length, 'Cache-Control': 'max-age=3600' });
+  res.end(buf);
+  return undefined;
+}
+
 // ============================================================ HTTP
+/**
+ * 只接受「Host 就是本机回环 + 本端口」的请求。
+ * 目的：挡住 DNS rebinding —— 恶意页面把某个域名解析到 127.0.0.1 时，
+ * 浏览器的 Host 头会是那个域名（不是 127.0.0.1），这里直接 403。
+ */
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+function hostAllowed(h) {
+  const raw = String(h || '').trim().toLowerCase();
+  const m = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(raw);
+  if (!m || !LOOPBACK.has(m[1])) return false;
+  return !m[2] || Number(m[2]) === PORT;
+}
+
+/** 控制面令牌：每次启动随机生成，经 rpc 交给本模组自己的 client（不落盘、不进 URL）。 */
+function tokenOk(rq, q) {
+  if (!TOKEN) return false;
+  return timingEq(String(rq.headers['x-soda-token'] || q.token || ''), TOKEN);
+}
+
 const server = http.createServer(async (rq, rs) => {
-  const u = new URL(rq.url, 'http://' + (rq.headers.host || '127.0.0.1'));
+  const reqHost = rq.headers.host;
+  // 全站不发 CORS 头：模组自己走 main 进程的 fetch（不受 CORS 约束）、设置页是同源，
+  // 都不需要它。少一个 `Access-Control-Allow-Origin: *`，任意网页就没法**读**这里的响应了。
+  if (!hostAllowed(reqHost)) { rs.writeHead(403); return rs.end('forbidden host'); }
+  const u = new URL(rq.url, 'http://' + reqHost);
   const q = Object.fromEntries(u.searchParams.entries());
 
-  if (rq.method === 'OPTIONS') {
-    rs.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS' });
-    return rs.end();
+  if (rq.method === 'OPTIONS') { rs.writeHead(204); return rs.end(); }
+
+  // ---- 健康探测：只回「活着」，不泄露端口外的任何信息（模组的就绪探测用它）----
+  if (u.pathname === '/health') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return rs.end(JSON.stringify({ ok: true, service: 'soda-subsonic' }));
   }
 
-  // ---- 设置页 & 控制 API ----
+  // ---- 设置页：要带令牌。带令牌的地址由 main 写进模组日志，点一下就能开 ----
   if (u.pathname === '/' || u.pathname === '/index.html') {
+    if (!tokenOk(rq, q)) {
+      rs.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return rs.end('需要令牌：请在模组日志里打开带 ?token=… 的地址');
+    }
     rs.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return rs.end(UI_HTML);
   }
-  if (u.pathname === '/api/raw') {
-    // 调试：直接打汽水接口，回原始文本
-    const p = q.p || '/luna/pc/me';
-    let out; let url = '';
-    try {
-      url = buildUrl(p) + (q.extra ? '&' + q.extra : '');
-      const r = await req(url, { method: q.method || 'GET', headers: signedHeaders(url, null, q.body || null), body: q.body || null });
-      out = { url, host: new URL(url).hostname, ok: r.status === 200, status: r.status, len: r.buf.length, text: r.buf.toString().slice(0, 300) };
-    } catch (e) { out = { ok: false, error: e.message, url: url, apiConst: API, host: (() => { try { return new URL(url).hostname; } catch (x) { return 'parse-fail'; } })() }; }
-    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return rs.end(JSON.stringify(out, null, 1));
+
+  // ---- 控制 API：一律要令牌（维护者审查意见：/api/* 没有鉴权 = 任意网页可跨站触发）----
+  if (u.pathname.startsWith('/api/') && !tokenOk(rq, q)) {
+    rs.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+    return rs.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
   }
+
   if (u.pathname === '/api/feed') {
     // 给模组的「无限续播」用：每次返回一批全新的推荐（池子是 splice 式的，天然不重复）
     let out;
@@ -1379,7 +1849,7 @@ const server = http.createServer(async (rq, rs) => {
       };
     } catch (e) { out = { ok: false, error: e.message, count: 0, songs: [] }; }
     const body = JSON.stringify(out);
-    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Content-Length': Buffer.byteLength(body) });
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
     return rs.end(body);
   }
   if (u.pathname === '/api/lines') {
@@ -1402,7 +1872,7 @@ const server = http.createServer(async (rq, rs) => {
       out = { ok: lines.length > 0 && isKrc, wordByWord: isKrc, count: lines.length, lines };
     } catch (e) { out = { ok: false, wordByWord: false, error: e.message, count: 0, lines: [] }; }
     const body = JSON.stringify(out);
-    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Content-Length': Buffer.byteLength(body) });
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
     return rs.end(body);
   }
   if (u.pathname === '/api/lyrics') {
@@ -1414,12 +1884,12 @@ const server = http.createServer(async (rq, rs) => {
       out = { ok: !!raw, format: isKrc ? 'krc' : 'lrc', text: raw, title: m.name, artist: (m.artists || []).join(' / ') };
     } catch (e) { out = { ok: false, error: e.message }; }
     const body = JSON.stringify(out);
-    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Content-Length': Buffer.byteLength(body) });
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
     return rs.end(body);
   }
   if (u.pathname === '/api/status') {
     const body = JSON.stringify({
-      ok: true, port: PORT, host: HOST, user: USER,
+      ok: true, port: PORT, host: HOST, user: USER, pass: SECRET,
       device: DEV && DEV.did, loggedIn: !!COOKIE,
       sessionHint: COOKIE ? (sessHint || (COOKIE.length + ' 字符')) : '',
       catalog: { tracks: CATALOG.tracks.size, albums: CATALOG.albums.size, artists: CATALOG.artists.size, playlists: CATALOG.playlists.length },
@@ -1444,17 +1914,13 @@ const server = http.createServer(async (rq, rs) => {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return rs.end(JSON.stringify(out));
   }
-  if (u.pathname === '/health') {
-    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-    return rs.end(JSON.stringify({ ok: true, service: 'soda-subsonic', port: PORT }));
-  }
   const m = /^\/rest\/([A-Za-z0-9_]+)(?:\.view)?$/.exec(u.pathname);
   if (!m) { rs.writeHead(404); return rs.end('not found'); }
   const name = m[1];
 
   const emit = (payload) => {
     const body = JSON.stringify({ 'subsonic-response': payload });
-    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Content-Length': Buffer.byteLength(body) });
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
     rs.end(body);
   };
 
@@ -1490,12 +1956,21 @@ async function start(opts = {}) {
   // 路径：优先用宿主给的 getter（Folium 1.5+）；否则退回 opts.dataDir（独立运行 / 旧宿主）
   if (opts.resolvePaths) {
     resolvePaths = opts.resolvePaths;
+  } else if (opts.embedded) {
+    // 内嵌进宿主却拿不到 paths：绝不能退回去写模组目录（会让模组授权摘要失配），
+    // 也不能写一个没申报过的目录 —— 直接报错，让模组面板把这条原因显示出来。
+    throw new Error('宿主没有提供 api.storage.paths（需要 Folium 1.5 / Folia 0.7.20+），拒绝在没有申报的目录里落盘');
   } else if (opts.dataDir) {
     FALLBACK_ROOT = path.resolve(opts.dataDir);
   }
   fs.mkdirSync(dataDir(), { recursive: true });
   fs.mkdirSync(cacheDir(), { recursive: true });
   fs.mkdirSync(lyricDir(), { recursive: true });
+
+  // 控制面令牌：每次启动重新生成；数据面密钥：首次生成后持久
+  TOKEN = crypto.randomBytes(24).toString('base64url');
+  loadSecret();
+  cleanLegacyLayout();
 
   log('soda-subsonic 启动中 …（数据 ' + dataDir() + ' / 缓存 ' + cacheDir() + '）');
 
@@ -1508,13 +1983,14 @@ async function start(opts = {}) {
     server.listen(PORT, HOST, () => { server.removeListener('error', onErr); resolve(); });
   });
   log('就绪 → http://' + HOST + ':' + PORT);
-  log('Folia 里填：Navidrome 服务器 http://' + HOST + ':' + PORT + '　用户名 ' + USER + '　密码 ' + PASS);
+  log('Folia 里填：Navidrome 服务器 http://' + HOST + ':' + PORT + '　用户名 ' + USER + '　密码 ' + SECRET);
+  log('设置页（带令牌，仅本机可开）：http://' + HOST + ':' + PORT + '/?token=' + TOKEN);
 
-  try { initNative(); } catch (e) { log('原生模块不可用: ' + e.message); }
+  try { await initNative(); } catch (e) { log('原生模块不可用: ' + e.message); }
 
   try {
     if (!loadDevice()) await registerDevice();
-    else { log('设备身份 did=' + DEV.did); initBdms(); }
+    else { log('设备身份 did=' + DEV.did); await initBdms(); }
   } catch (e) { log('设备身份初始化失败: ' + e.message); }
 
   loadSession();
@@ -1529,10 +2005,11 @@ async function start(opts = {}) {
   const timer = setInterval(() => refreshCatalog(true).catch(() => { }), CATALOG_TTL);
 
   return {
-    port: PORT, host: HOST, user: USER, pass: PASS,
+    port: PORT, host: HOST, user: USER, pass: SECRET, token: TOKEN,
     log: () => LOG_RING.slice(),
     stop() {
       try { clearInterval(timer); } catch (e) { }
+      hostStop();
       return new Promise((resolve) => {
         try { server.close(() => resolve(true)); } catch (e) { resolve(false); }
       });

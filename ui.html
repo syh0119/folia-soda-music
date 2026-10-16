@@ -59,7 +59,8 @@
     </div>
     <div class="hint">
       需要本机安装并<b>登录过</b>汽水音乐 PC 客户端，且同步时<b>客户端已完全退出</b>（否则 Cookies 库被占用）。<br>
-      换机器使用：装好汽水客户端并登录 → 运行本服务 → 点上面的按钮即可。登录态会缓存到 <code>_session.txt</code>。
+      换机器使用：装好汽水客户端并登录 → 运行本服务 → 点上面的按钮即可。<br>
+      登录态用宿主的加密存储（Electron <code>safeStorage</code>）加密后写入数据目录，不再明文落盘；拿不到加密能力时只留在内存里。
     </div>
   </div>
 
@@ -68,7 +69,7 @@
     <ol class="steps">
       <li>打开 Folia → <code>设置</code> → 音源/资料库 → <b>Navidrome</b></li>
       <li>服务器地址填 <code id="s-url">http://127.0.0.1:4533</code></li>
-      <li>用户名 <code id="s-user">soda</code>　密码 <code id="s-pass">soda</code></li>
+      <li>用户名 <code id="s-user">soda</code>　密码 <code id="s-pass">（自动生成的密钥）</code></li>
       <li>保存后首页会出现 Navidrome 页签，歌单在 <b>Playlists</b> 区域</li>
       <li>歌单里四条来源：<b>① 启动播放队列</b> / <b>我喜欢的音乐</b> / <b>我的歌单</b> / <b>④ 推荐流</b></li>
     </ol>
@@ -91,8 +92,13 @@ function setLog(lines){
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 
+// 控制面令牌：由 main 写进模组日志的地址里带过来（页面本身不带令牌会被 403）
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+
 async function api(path, opt){
-  const r = await fetch(path, opt);
+  const o = Object.assign({}, opt || {});
+  o.headers = Object.assign({}, (opt && opt.headers) || {}, TOKEN ? { 'x-soda-token': TOKEN } : {});
+  const r = await fetch(path, o);
   return r.json();
 }
 
@@ -109,6 +115,7 @@ async function tick(){
     $('s-loaded').textContent = s.loadedAt ? new Date(s.loadedAt).toLocaleString('zh-CN') : '尚未刷新';
     $('s-url').textContent = 'http://' + (s.host || '127.0.0.1') + ':' + s.port;
     $('s-user').textContent = s.user;
+    $('s-pass').textContent = s.pass || '（见模组日志）';
     setLog(s.log || []);
   }catch(e){
     $('s-server').innerHTML = '<span class="badge no">连接失败</span>';
