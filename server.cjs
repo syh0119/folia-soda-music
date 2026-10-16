@@ -983,6 +983,7 @@ async function fillFeed(target) {
 
 /** 每次要给出去的量 */
 const feedWant = () => Math.min(FEED_PAGES * FEED_BATCH, FEED_MAX_COUNT);
+
 /**
  * 池子维持的库存 = 2 倍给量。
  * 为什么要 2 倍：取走一次后还剩一整份，下一次仍然是秒开（试过只留一份缓冲，
@@ -1005,6 +1006,278 @@ const fetchFeedCached = () => fetchFeedN(feedWant());
 /** 预热池子：启动 / 每次目录刷新后调用 */
 function prewarmFeed() {
   fillFeed(feedTarget()).catch(() => { });
+}
+
+/**
+ * 「歌 → 歌单」反查索引 —— 续播跟着**当前歌单**走靠它。
+ * ===========================================================================
+ * 为什么要反查：Folia 的书库走标准 Navidrome 通道，模组的 client 根本不在那条路上，
+ * 拿不到「用户点的是哪个歌单」。它能拿到的只有 `playback.getState().currentSong`，
+ * 所以只能拿当前这首曲目去曲库里反查它出现在哪些歌单里，再用那个歌单当续播上下文。
+ *
+ * 构建代价：要把所有歌单的曲目拉一遍（十几个 playlist/detail，每个都过原生签名）。
+ * 因此：① 只在后台预热，**绝不让续播请求等它**；② 带 TTL；③ 单个歌单失败不影响其它。
+ * 索引没就绪时 takeFromContext 直接返回空 → 调用方落回通用推荐流，行为跟以前一样。
+ */
+const CTX_TTL = 30 * 60 * 1000;
+const ctxIndex = { bySong: null, at: 0, building: null };
+
+/**
+ * 粘性上下文：最近一次成功反查出来的歌单。
+ *
+ * 为什么需要：相关推荐补进来的歌**不在歌单里**，下一轮拿它反查必然落空 ——
+ * 没有粘性的话，风格会在「歌单 → 相关推荐 → 通用流」之间断掉。
+ * 有了它，从歌单播出去之后风格能一直延续；切走 15 分钟后自动脱落，不会串味。
+ */
+const stickyCtx = { plIds: [], names: [], at: 0 };
+const STICKY_TTL = 15 * 60 * 1000;
+
+function buildContextIndex() {
+  if (ctxIndex.building) return ctxIndex.building;
+  ctxIndex.building = (async () => {
+    const bySong = new Map();
+    const list = CATALOG.playlists.filter(p => p.srcId && !p.live);   // 虚拟来源（推荐流）不参与
+    let done = 0;
+    for (const pl of list) {
+      try {
+        const ts = await playlistTracks(pl);
+        for (const t of ts) {
+          const id = String(t.id);
+          const arr = bySong.get(id);
+          if (arr) { if (!arr.includes(pl.id)) arr.push(pl.id); }
+          else bySong.set(id, [pl.id]);
+        }
+        done++;
+      } catch (e) { /* 单个歌单拉失败就跳过 */ }
+    }
+    if (bySong.size) {
+      ctxIndex.bySong = bySong;
+      ctxIndex.at = Date.now();
+      log('续播上下文索引已建：' + bySong.size + ' 曲 / ' + done + '/' + list.length + ' 个歌单');
+    } else {
+      // 一个歌单都没拉到：这是「续播永远跟不上歌单」的头号嫌疑，必须留痕
+      log('续播上下文索引为空：' + done + '/' + list.length + ' 个歌单成功，bySong.size=0');
+    }
+    diagAdd({
+      at: new Date().toISOString(), event: 'buildContextIndex',
+      songs: bySong.size, playlists: list.length, ok: done,
+      names: list.map(p => p.name),
+    });
+  })().catch((e) => { log('续播上下文索引失败: ' + e.message); })
+     .finally(() => { ctxIndex.building = null; });
+  return ctxIndex.building;
+}
+
+/** 索引是否就绪（过期也算不就绪） */
+const ctxReady = () => !!(ctxIndex.bySong && Date.now() - ctxIndex.at < CTX_TTL);
+
+/** 触发一次后台构建，不等待 */
+function touchContextIndex() {
+  if (!ctxIndex.building && !ctxReady()) buildContextIndex();
+}
+
+/**
+ * 按种子曲目拉「同风格」的歌 —— `POST /luna/track/related`。
+ * ===========================================================================
+ * 结构取自汽水客户端 asar 的 `GetRelatedTracksRequest`：
+ *   { track_ids?: string[], artist_ids?: string[], scene_name?: string, ... }（全部可选）
+ * **只给 `track_ids` 当种子就行** —— 不用像 `/luna/playlist/feed/media` 那样凑一堆
+ * 上下文参数（那个实测 15 个歌单 × 两种 play_mode 全返回空）。
+ *
+ * 实测响应形状（与 `/luna/pc/feed/song-tab` 一致，所以能共用同一套取值路径）：
+ *   { status_info, has_more: boolean, items: [{ id, type:'track',
+ *       entity: { track_wrapper: { track: {...} } } }] }
+ * 只有 `has_more`、**没有游标** ⇒ 想持续拉就得**换种子**（见 takeFromContext）。
+ */
+function pickTrackFromItem(it) {
+  if (!it || typeof it !== 'object') return null;
+  const t = (it.entity && it.entity.track_wrapper && it.entity.track_wrapper.track)
+    || it.track_wrapper && it.track_wrapper.track
+    || it.track
+    || (it.entity && it.entity.track)
+    || null;
+  return (t && t.id) ? t : null;
+}
+
+/** 已经从「按种子推荐」给出去过的歌（按顺序），用来告诉服务端「这些我听过了」 */
+const relatedGiven = [];
+const RELATED_GIVEN_MAX = 120;
+
+async function lunaRelatedTracks(seedIds, dump) {
+  const ids = (seedIds || []).filter(Boolean).slice(0, 8).map(String);
+  if (!ids.length) return null;
+  const body = { track_ids: ids };
+  // `played_media`（客户端 asar 的 media.MediaPlayed）：把已经给出去过的歌报上去，
+  // 服务端据此换一批新的 —— 只回 has_more 没有游标，这是唯一能「翻页」的手段。
+  if (relatedGiven.length) {
+    body.played_media = relatedGiven.slice(-50).map((id) => {
+      const t = CATALOG.tracks.get(id);
+      return { media_id: String(id), type: 'track', played_mills: 0, duration: (t && t.duration) || 0 };
+    });
+  }
+  const j = await rpcPost('/luna/track/related', body);
+  const items = (j && Array.isArray(j.items)) ? j.items : [];
+  const tracks = [];
+  for (const it of items) {
+    const t = pickTrackFromItem(it);
+    if (t) tracks.push(normTrack(t));
+  }
+  if (dump && !tracks.length) {
+    diagAdd({
+      at: new Date().toISOString(), event: 'relatedTracks-unparsed',
+      seeds: ids, played: (body.played_media || []).length, status_code: j && j.status_code,
+      keys: j ? Object.keys(j) : null,
+      shape: j ? JSON.stringify(j).slice(0, 2000) : null,
+    });
+  }
+  return { tracks, hasMore: !!(j && j.has_more), count: items.length };
+}
+
+/**
+ * 从「当前这首曲目所属的歌单」里挑还没给出去过的歌。
+ * 拿不到上下文（索引没建好 / 这首歌不在任何歌单里）就返回空，调用方落回通用推荐流。
+ * 给出去的会记进 feedPool.seen，并顺手从待发队列里摘掉，保证同一次会话内不重复。
+ *
+ * 返回里带一个 `info`，说明这次为什么走上/没走上歌单 —— 续播出问题时全靠它定位，
+ * 会被写进 paths.data/diag.json（见 diagAdd）。
+ */
+async function takeFromContext(seedId, n) {
+  const info = {
+    ready: ctxReady(),
+    indexSize: ctxIndex.bySong ? ctxIndex.bySong.size : 0,
+    building: !!ctxIndex.building,
+    hit: [],
+    reason: '',
+  };
+  if (!info.ready) {
+    touchContextIndex();                       // 顺手把它催起来，下一次就成了
+    info.reason = '索引未就绪';
+    return { songs: [], name: '', info };
+  }
+  const plIds = ctxIndex.bySong.get(String(seedId));
+  if (!plIds || !plIds.length) {
+    if (stickyCtx.plIds.length && Date.now() - stickyCtx.at < STICKY_TTL) {
+      // 当前这首歌已经不是歌单里的了（比如上一轮 related 补进来的）——
+      // 沿用上一次的上下文，风格才不会被切断。
+      info.hit = stickyCtx.names;
+      info.sticky = true;
+      info.reason = '当前歌不在歌单里，沿用上一次的上下文';
+      return await serveFromPlaylists(stickyCtx.plIds, seedId, n, '', info);
+    }
+    info.reason = '这首歌不在任何已收录的歌单里';
+    return { songs: [], name: '', info };
+  }
+  stickyCtx.plIds = plIds;
+  stickyCtx.at = Date.now();
+  stickyCtx.names = plIds.map(id => (CATALOG.playlists.find(p => p.id === id) || {}).name).filter(Boolean);
+  info.hit = stickyCtx.names;
+  return await serveFromPlaylists(plIds, seedId, n, '', info);
+}
+
+/**
+ * 续播的主体：先从歌单的静态曲目里取，取完再用**歌单里的歌当种子**调
+ * `/luna/track/related` 拉同风格的歌。
+ *
+ * 种子**每轮随机抽**（不从同一处拿）—— 因为 related 接口只回 `has_more`、没有游标，
+ * 用固定种子只会每次要回同一批，被去重集合一挡就再也给不出新歌。随机抽能保证
+ * 每轮落在歌单风格的不同邻域里，于是能一直续下去；同时把「当前正在播的歌」也塞进去
+ * 当锚点，保证跟着当下的听感走。
+ */
+async function serveFromPlaylists(plIds, seedId, n, usedName, info) {
+  const out = [];
+  const take = (t) => {
+    const id = String(t.id);
+    if (feedPool.seen.has(id)) return false;
+    feedPool.seen.add(id);
+    const qi = feedPool.q.findIndex(x => String(x.id) === id);
+    if (qi >= 0) feedPool.q.splice(qi, 1);
+    out.push(t);
+    return true;
+  };
+
+  // 1) 歌单自带的曲目，优先
+  const pool = [];
+  for (const plId of plIds) {
+    const pl = CATALOG.playlists.find(p => p.id === plId);
+    if (!pl) continue;
+    let ts = [];
+    try { ts = await playlistTracks(pl); } catch (e) { continue; }
+    for (const t of ts) { pool.push(String(t.id)); if (out.length < n) take(t); }
+    if (out.length && !usedName) usedName = pl.name;
+    if (out.length >= n) break;
+  }
+  info.pool = pool.length;
+
+  // 2) 歌单取完 → 按种子拉同风格的歌。**多轮换种子**：一次 related 只回十几个 item，
+  //    而且用同一批种子要回来的基本是同一批（会被去重挡掉），所以每轮都重新随机抽种子。
+  //
+  //    种子池分两层：
+  //      · origPool  —— 歌单自带的曲目。每轮固定占一半，**风格锚定在歌单上**，不会越漂越远。
+  //      · grownPool —— 加上 related 长出来的新歌。另一半从这儿抽，池子才会自我增长；
+  //                     只用 origPool 的话，抽几轮就全是重复的，续播第二次就枯竭。
+  if (out.length < n) {
+    const origPool = [...new Set(pool)];
+    const grownPool = new Set(origPool);
+    const anchor = /^\d{1,32}$/.test(String(seedId || '')) ? String(seedId) : '';
+    let rounds = 0, fetched = 0, hasMore = false, used = 0, dry = 0;
+    while (out.length < n && rounds < 14 && origPool.length) {
+      rounds += 1;
+      const seeds = anchor ? [anchor] : [];
+      const draw = (arr, want, avoid) => {
+        let guard = 0;
+        while (seeds.length < want && guard < 40) {
+          guard += 1;
+          const pick = arr[Math.floor(Math.random() * arr.length)];
+          if (!avoid.includes(pick)) { avoid.push(pick); seeds.push(pick); }
+        }
+      };
+      const picked = [];
+      draw(origPool, 2, picked);                                  // 锚定：1 首歌单原曲（+anchor）
+      draw([...grownPool], 3, picked);                            // 再补 1 首，让邻域能往外跳
+      if (!seeds.length) break;
+      try {
+        const r = await lunaRelatedTracks(seeds, rounds === 1);
+        if (!r || !r.tracks.length) break;
+        fetched += r.tracks.length;
+        hasMore = r.hasMore;
+        let got = 0;
+        for (const t of r.tracks) {
+          grownPool.add(String(t.id));
+          if (out.length >= n) break;
+          if (take(t)) {
+            got += 1;
+            used += 1;
+            relatedGiven.push(String(t.id));
+            if (relatedGiven.length > RELATED_GIVEN_MAX) relatedGiven.shift();
+          }
+        }
+        if (!got) { dry += 1; if (dry >= 3) break; } else { dry = 0; }
+      } catch (e) {
+        info.related = { error: (e && e.message) || String(e) };
+        break;
+      }
+    }
+    if (rounds) info.related = { rounds, fetched, used, hasMore, pool: origPool.length, grown: grownPool.size };
+    if (used && !usedName) usedName = stickyCtx.names[0] || '（同类推荐）';
+  }
+
+  if (!out.length) info.reason = info.reason || '这个歌单里已经给不出新歌了';
+  return { songs: out, name: usedName, info };
+}
+
+/**
+ * 续播决策的落盘记录。
+ * 模组日志只发给渲染端、**不落盘**，而「续播为什么没跟上歌单」光看界面看不出来。
+ * 所以把每次 /api/feed 的决策写进 paths.data/diag.json（最近 40 条），出问题直接读文件。
+ * 诊断本身绝不能影响功能 —— 所有失败都吞掉。
+ */
+const DIAG = [];
+function diagAdd(rec) {
+  try {
+    DIAG.push(rec);
+    if (DIAG.length > 40) DIAG.shift();
+    fs.writeFileSync(path.join(dataDir(), 'diag.json'), JSON.stringify(DIAG, null, 1));
+  } catch (e) { /* 写不了就算了 */ }
 }
 
 // ============================================================ 目录缓存
@@ -1117,6 +1390,8 @@ async function refreshCatalog(force) {
     CATALOG.playlists = pls;
     CATALOG.loadedAt = Date.now();
     prewarmFeed();   // 预热推荐流池（后台，不等待）
+    // 「歌 → 歌单」反查索引：等几秒再建，别和刚结束的目录刷新抢签名请求；同样不等待
+    setTimeout(() => { try { touchContextIndex(); } catch (e) { } }, 8000);
     log('目录已刷新：' + CATALOG.tracks.size + ' 曲 / ' + CATALOG.albums.size + ' 专辑 / ' + CATALOG.artists.size + ' 歌手 / ' +
       pls.length + ' 歌单，用时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's');
   })().finally(() => { CATALOG.loading = null; });
@@ -1858,19 +2133,66 @@ const server = http.createServer(async (rq, rs) => {
   // 最多等 10 秒，等不到就照常处理，不把请求挂死。
   if (u.pathname.startsWith('/rest/')) await waitReady(10000);
 
+  if (u.pathname === '/api/context') {
+    // 诊断用：当前这首歌反查出来属于哪些歌单（续播会跟着第一个走）。
+    // 顺手在索引不就绪时触发一次后台构建 —— 用户执行「无限续播状态」就能把它催起来。
+    const ready = ctxReady();
+    const playlists = [];
+    if (ready && q.song) {
+      for (const id of (ctxIndex.bySong.get(String(q.song)) || [])) {
+        const pl = CATALOG.playlists.find(p => p.id === id);
+        if (pl) playlists.push({ id: pl.id, name: pl.name });
+      }
+    }
+    if (!ready) touchContextIndex();
+    const body = JSON.stringify({
+      ok: true, ready,
+      indexSize: ctxIndex.bySong ? ctxIndex.bySong.size : 0,
+      building: !!ctxIndex.building,
+      playlists,
+    });
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+    return rs.end(body);
+  }
+
   if (u.pathname === '/api/feed') {
     // 给模组的「无限续播」用：每次返回一批全新的推荐（池子是 splice 式的，天然不重复）
+    //
+    // `song=<当前曲目 id>`（可选）：**续播跟着当前歌单走**。
+    //   先给「这首歌所属歌单」里还没给出去过的歌，不够再从通用推荐流补。
+    //   拿不到上下文（索引还没建好 / 这首不在任何歌单里）时行为与以前完全一致，就是纯推荐流。
     let out;
     try {
       const n = parseInt(q.n || '60', 10) || 60;
-      const ts = await fetchFeedN(n);
+      let ts = [];
+      let source = '';
+      let info = null;
+      if (q.song) {
+        const got = await takeFromContext(String(q.song), n);
+        ts = got.songs;
+        source = got.name;
+        info = got.info;
+        log('续播上下文 seed=' + q.song + ' → ' +
+          (info.hit.length ? '「' + info.hit.join(' / ') + '」' : info.reason) +
+          '，给出 ' + ts.length + ' 首');
+      }
+      const rest = n - ts.length;
+      if (rest > 0) ts = ts.concat(await fetchFeedN(rest));
       out = {
-        ok: true, count: ts.length,
+        ok: true, count: ts.length, source,
         songs: ts.map(t => ({
           id: t.id, name: t.name, artists: t.artists || [], album: t.album || '',
           cover: t.cover || '', duration: t.duration || 0,
         })),
       };
+      diagAdd({
+        at: new Date().toISOString(), n,
+        seed: q.song ? String(q.song) : null,
+        source: source || null, got: ts.length,
+        indexSize: ctxIndex.bySong ? ctxIndex.bySong.size : 0,
+        building: !!ctxIndex.building,
+        info,
+      });
     } catch (e) { out = { ok: false, error: e.message, count: 0, songs: [] }; }
     const body = JSON.stringify(out);
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });

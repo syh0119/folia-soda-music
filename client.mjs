@@ -321,15 +321,34 @@ export default function activate(folium) {
   // 续播有了，但 FM 模式会把播放页的「队列」页签换成「电台」面板 —— 用户要看队列列表。
   //
   // 这版改为自己盯播放队列（不开 FM）：
-  //   · 每 5 秒读一次 playback store（playQueue + currentSong）
+  //   · 每 10 秒读一次 playback store（playQueue + currentSong）
   //   · 「当前之后剩 ≤ 2 首」时，把汽水推荐直接追加进 playQueue（去重）
   // 不碰 omni、不碰 isFmMode，队列页签保持原样。仍然需要 internals（folia 版本范围）。
+  //
+  // 续播**跟着当前歌单走**：Folia 的书库走标准 Navidrome 通道，client 不在那条路上，
+  // 拿不到「用户点的是哪个歌单」，所以把 currentSong 的 id 交给服务端反查它属于哪个歌单，
+  // 优先续那个歌单里还没播过的歌，取完了才落回通用推荐流。见 server.cjs 的 takeFromContext。
   const PROVIDER_ID = 'folium.soda-music.soda';   // 宿主 id 规则：folium.<modid>.<providerid>
+
+  /**
+   * 从宿主给的曲目对象里取**我们自己的**曲目 id（Subsonic 的纯数字 id）。
+   *
+   * ⚠️ 血泪教训：宿主内部另有一个自己的 `song.id`（实测是**负数**，例如
+   * `-7492310190520961000`），和我们的 id 完全不是一回事。用它去查汽水一律查不到 ——
+   * 表现为「续播反查歌单永远落空」。所以这里**只认纯数字**，负数/带前缀的一律丢掉。
+   * 取值优先级：sourceRef.mediaId → mediaId → id（仅当它是纯数字）。
+   */
+  const ourIdOf = (song) => {
+    if (!song) return '';
+    const num = (v) => (/^\d{1,32}$/.test(String(v == null ? '' : v)) ? String(v) : '');
+    return num(song.sourceRef && song.sourceRef.mediaId) || num(song.mediaId) || num(song.id);
+  };
   const FM_BATCH = 60;                            // 每次续拉多少首
   const FM_REMAIN = 2;                            // 剩几首时触发
   const QUEUE_MAX = 100;                          // 队列上限：超过就裁掉前面序号靠前的
   const FM_TICK_MS = 10000;                       // 盯队列的间隔
   let fmTimer = null;
+  let curShapeDumped = false;   // 只把宿主曲目对象形状留档一次
 
   /** 把汽水的推荐流歌曲转成宿主内部的 UnifiedSong（字段照 omniProviders.ts 的 toUnifiedSong） */
   const toUnified = (s) => {
@@ -347,13 +366,21 @@ export default function activate(folium) {
     };
   };
 
-  /** 从音源服务取一批全新的推荐歌 */
-  async function feedSongs(n) {
-    const r = await apiFetch('/api/feed?n=' + (n || FM_BATCH), { timeoutMs: 60000 });
+  /**
+   * 从音源服务取一批推荐歌。
+   *
+   * `seedId` = 当前正在播的曲目 id。服务端拿它反查这首歌属于哪个歌单，
+   * 优先给**那个歌单**里还没给出去过的歌（即「续播跟着当前歌单走」），
+   * 不够再落回通用推荐流。返回 `{ songs, source }`，`source` 是本次实际用的歌单名
+   * （空串 = 走的是通用推荐流）。
+   */
+  async function feedSongs(n, seedId) {
+    const r = await apiFetch('/api/feed?n=' + (n || FM_BATCH)
+      + (seedId ? '&song=' + encodeURIComponent(seedId) : ''), { timeoutMs: 60000 });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = r.json();
-    if (!j || !j.ok || !Array.isArray(j.songs) || !j.songs.length) return [];
-    return j.songs.map(toUnified);
+    if (!j || !j.ok || !Array.isArray(j.songs) || !j.songs.length) return { songs: [], source: '' };
+    return { songs: j.songs.map(toUnified), source: String(j.source || '') };
   }
 
   /**
@@ -389,12 +416,35 @@ export default function activate(folium) {
       const q = st.playQueue || [];
       if (!q.length) return;
       const cur = st.currentSong;
-      const curId = cur ? String(cur.id ?? (cur.sourceRef && cur.sourceRef.mediaId) ?? '') : '';
+      // ⚠️ 这里有两个不同的 id，千万别混（混过，代价是续播反查永远落空）：
+      //   curId  —— 宿主**内部**的曲目 id（实测是负数），只能用来在 playQueue 里定位
+      //   seedId —— **我们自己的** Subsonic 曲目 id（纯数字），交给服务端反查歌单用
+      const curId = cur ? String(cur.id == null ? '' : cur.id) : '';
+      const seedId = ourIdOf(cur);
       const ci = curId ? q.findIndex(x => String(x.id) === curId) : -1;
       const remain = ci >= 0 ? q.length - ci - 1 : q.length;
       if (remain > FM_REMAIN) return;
       const have = new Set(q.map(x => String(x.id)));
-      const songs = (await feedSongs(FM_BATCH)).filter(x => !have.has(String(x.id)));
+      // 一次性把宿主给的曲目对象形状留档：万一下次 id 取法又变了，直接看这个
+      if (cur && !curShapeDumped) {
+        curShapeDumped = true;
+        try {
+          flagsSet('__curShape', {
+            at: new Date().toISOString(),
+            curId, seedId,
+            source: cur.source == null ? '(无字段)' : String(cur.source),
+            curKeys: Object.keys(cur),
+            curSourceRef: cur.sourceRef ? JSON.parse(JSON.stringify(cur.sourceRef)) : null,
+            queueItemKeys: q[0] ? Object.keys(q[0]) : [],
+            queueItemId: q[0] ? String(q[0].id) : '',
+            queueItemSourceRef: q[0] && q[0].sourceRef ? JSON.parse(JSON.stringify(q[0].sourceRef)) : null,
+          }).catch(() => { });
+        } catch (e) { }
+      }
+      // 把当前曲目交给服务端当上下文：它反查出这首歌属于哪个歌单，
+      // 优先续那个歌单里的歌（不够才落回通用推荐流）。
+      const got = await feedSongs(FM_BATCH, seedId);
+      const songs = got.songs.filter(x => !have.has(String(x.id)));
       if (!songs.length) return;
       // 先试公开 API；一首都没进去才退回内部 store（避免两条路同时追加造成重复）
       let added = 0;
@@ -405,7 +455,9 @@ export default function activate(folium) {
         st.setPlayQueue(nq);
         added = songs.length;
       }
-      say('无限续播：已续上 ' + added + ' 首');
+      say('无限续播：已续上 ' + added + ' 首'
+        + (got.source ? '，跟着「' + got.source + '」'
+                      : '（通用推荐流；当前曲目 id=' + (curId || '拿不到') + '）'));
     };
     if (fmTimer) return;
     flagsSet('endless', 1);
@@ -430,15 +482,17 @@ export default function activate(folium) {
     id: 'endless-on',
     label: { 'zh-CN': '开启无限续播', en: 'Enable endless radio' },
     description: {
-      'zh-CN': '每 10 秒盯一次播放队列，剩 2 首时自动追加一批全新的汽水推荐（60 首、不重复）。' +
+      'zh-CN': '每 10 秒盯一次播放队列，剩 2 首时自动追加一批新歌（60 首、不重复）。\n' +
+        '续播会**跟着当前歌单走**：拿正在播的这首歌反查它属于哪个歌单，优先续那个歌单里还没播过的歌；' +
+        '那个歌单取完了才落回汽水的通用推荐流。\n' +
         '不开私人 FM 模式，播放页的「队列」列表保持原样。开关存在模组数据目录里，重启 Folia 后自动恢复。',
-      en: 'Watch the queue every 5s and append fresh Soda recommendations when only 2 songs remain.',
+      en: 'Watch the queue every 10s and append fresh songs when only 2 remain. Follows the playlist the current song belongs to first, then falls back to the general recommendation feed.',
     },
     keywords: ['汽水', '续播', '无限', '推荐', 'fm', 'soda', 'endless', 'radio'],
     run: async () => {
       try {
         enableEndless();
-        return { message: '无限续播已开启：队列剩 ' + FM_REMAIN + ' 首时自动续上汽水推荐（每次 ' + FM_BATCH + ' 首，不重复）。' };
+        return { message: '无限续播已开启：队列剩 ' + FM_REMAIN + ' 首时自动续上（每次 ' + FM_BATCH + ' 首，不重复），优先跟着当前歌单走。' };
       } catch (e) {
         const msg = '开启失败：' + e.message;
         say(msg);
@@ -485,10 +539,25 @@ export default function activate(folium) {
           '监听：' + (fmTimer ? '运行中' : '未开启'),
           '队列长度：' + q.length,
           '当前歌曲：' + (cur ? (cur.name || curId) : '(无)'),
+          '当前曲目 id：' + (curId || '(拿不到 —— 续播就没法反查歌单)'),
+          '曲目来源：' + (cur ? String(cur.source || '(无 source 字段)') : '(无)'),
           '当前序号：' + (ci >= 0 ? ci + ' / ' + (q.length - 1) : '未在队列中匹配到（id=' + (curId || '空') + '）'),
           '剩余：' + remain + ' 首（剩 ' + FM_REMAIN + ' 首触发追加）',
         ];
         if (ci === -1 && curId) lines.push('⚠️ 当前歌曲在队列里找不到 —— 这会让续播不触发，把这条发给我');
+        // 续播上下文：当前这首歌反查出来属于哪些歌单（续播跟着第一个走）
+        try {
+          const cr = await apiFetch('/api/context?song=' + encodeURIComponent(curId || ''), { timeoutMs: 8000 });
+          const cj = cr.ok ? cr.json() : null;
+          if (cj && cj.ready) {
+            lines.push('续播上下文：' + (cj.playlists.length
+              ? cj.playlists.map((p) => p.name).join(' / ')
+              : '这首歌不在任何已收录的歌单里 → 走通用推荐流'));
+          } else {
+            lines.push('续播上下文：索引还没建好（已收录 ' + (cj ? cj.indexSize : '?') + ' 曲'
+              + (cj && cj.building ? '，构建中' : '') + '）→ 暂时走通用推荐流');
+          }
+        } catch (e) { lines.push('续播上下文：查询失败（' + e.message + '）'); }
         return { message: lines.join('\n') };
       } catch (e) {
         return { message: '查询失败：' + e.message };
