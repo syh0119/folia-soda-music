@@ -144,7 +144,7 @@ export default function activate(folium) {
         description: {
           'zh-CN': '开着时会把书库的 Navidrome 页签指到本机音源 —— 这是本模组**唯一**会改宿主配置的地方' +
             '（写宿主的 navidrome_config / navidrome_enabled），而且只在你还没配过、或本来就指向本机时才写。' +
-            '不想让它动宿主配置就关掉，然后按模组日志里打印的地址和密码自己填。',
+            '不想让它动宿主配置就关掉，然后自己填地址与密码（密码是数据目录里 auth.json 的那把随机密钥）。',
           en: 'When on, points the library Navidrome tab at the local server. Turn off to configure it yourself.',
         },
       },
@@ -210,9 +210,15 @@ export default function activate(folium) {
    * `startsWith('http:')` 判不到大写，改写被跳过。已实测修复「封面空白」。
    */
   const coverBase = () => base().replace(/^http:/, 'HTTP:');
+  /**
+   * 只有指向本机（回环）时才带控制面令牌。
+   * 维护者审查意见：设置里的「服务器地址」可以填别人的服务器，之前会把 `x-soda-token`
+   * 一起发过去 —— 令牌等于泄漏给第三方。非回环地址一律不带（那种情况也用不上它）。
+   */
+  const isLoopback = (s) => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(String(s || ''));
   /** 控制面请求（/api/*）：带上每次启动随机的令牌 —— 少了它服务端一律 401 */
   const apiFetch = (path, init) => folium.net.fetch(base() + path, Object.assign({}, init || {}, {
-    headers: Object.assign({}, (init && init.headers) || {}, CONN.token ? { 'x-soda-token': CONN.token } : {}),
+    headers: Object.assign({}, (init && init.headers) || {}, (CONN.token && isLoopback(base())) ? { 'x-soda-token': CONN.token } : {}),
   }));
 
   /** 调 Subsonic 接口；net.fetch 的 json() 是同步方法，不要 await */

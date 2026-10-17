@@ -34,8 +34,20 @@ const zlib = require('zlib');
 const { spawn, execFileSync } = require('child_process');
 
 // ============================================================ 配置
-const PORT = parseInt(process.env.PORT || '4533', 10);
-const HOST = process.env.HOST || '127.0.0.1';
+/**
+ * 运行模式：`start({ embedded: true })` 时置真。**嵌入模式一律不读环境变量**
+ * （维护者审查意见）：用户全局设了 `HOST=0.0.0.0` 就会把本机服务暴露到局域网，
+ * `SUB_PASS`/`SODA_NATIVE_DIR` 同理 —— 密码变成可猜的固定值、原生模块目录可被指到任意位置。
+ * 环境变量只对独立运行（`node soda_subsonic.js`）生效。
+ */
+let EMBEDDED = false;
+let PORT = parseInt(process.env.PORT || '4533', 10);
+let HOST = process.env.HOST || '127.0.0.1';
+/** 系统目录下的可执行文件全路径 —— 不按名字走 PATH（同名程序可以劫持） */
+const SYS32 = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
+const EXE_REG = process.platform === 'win32' ? path.join(SYS32, 'reg.exe') : 'reg';
+const EXE_PS = process.platform === 'win32'
+  ? path.join(SYS32, 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell';
 /**
  * 本机服务的两把钥匙（维护者审查意见：不许再用固定账号 soda/soda）：
  *   · SECRET —— 数据面（`/rest/*`）的密码。**持久化**在 paths.data/auth.json。
@@ -45,7 +57,7 @@ const HOST = process.env.HOST || '127.0.0.1';
  * 用户名保持固定的 'soda'：用户名不是秘密，密码才是。
  */
 const USER = process.env.SUB_USER || 'soda';
-let SECRET = process.env.SUB_PASS || '';
+let SECRET = process.env.SUB_PASS || '';   // 嵌入模式下 start() 会先清空，再读/生成 auth.json
 let TOKEN = '';
 const APP_ID = '386088';
 const APP_VERSION = '3.8.0';
@@ -241,7 +253,7 @@ function clientInstallDirs() {
     ];
     for (const root of roots) {
       let text = '';
-      try { text = execFileSync('reg', ['query', root, '/s'], { encoding: 'utf8', maxBuffer: 16 << 20 }); }
+      try { text = execFileSync(EXE_REG, ['query', root, '/s'], { encoding: 'utf8', maxBuffer: 16 << 20 }); }
       catch (e) { continue; }
       let cur = {};
       const flush = () => {
@@ -274,7 +286,7 @@ function findNativeIn(base) {
 
 function resolveNativeDir() {
   const cands = [];
-  if (process.env.SODA_NATIVE_DIR) cands.push(process.env.SODA_NATIVE_DIR);
+  if (!EMBEDDED && process.env.SODA_NATIVE_DIR) cands.push(process.env.SODA_NATIVE_DIR);
   cands.push(path.join(ASSET, 'native'));          // 模组自带（可选）
   cands.push(path.join(ASSET, 'lib', 'native'));   // 独立运行的布局
   cands.push(path.join(ASSET, 'native'));
@@ -401,7 +413,7 @@ async function registerDevice() {
 
 function ps(cmd, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const p = spawn('powershell', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', cmd], { windowsHide: true });
+    const p = spawn(EXE_PS, ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', cmd], { windowsHide: true });
     let o = '', e = '', done = false;
     const timer = setTimeout(() => {
       if (done) return;
@@ -447,54 +459,62 @@ async function refreshSessionFromClient() {
   }
   const tmp = path.join(os.tmpdir(), 'soda_ck_' + Date.now());
   fs.mkdirSync(tmp, { recursive: true });
-  fs.copyFileSync(lsPath, path.join(tmp, 'LocalState.json'));
-  try { fs.copyFileSync(ckPath, path.join(tmp, 'Cookies')); }
-  catch (e) { throw new Error('Cookies 库被占用 —— 请先完全退出汽水音乐客户端再试'); }
-
-  const ls = JSON.parse(fs.readFileSync(path.join(tmp, 'LocalState.json'), 'utf8'));
-  const ek = Buffer.from(ls.os_crypt.encrypted_key || '', 'base64').subarray(5);
-  if (!ek.length) throw new Error('Local State 无 encrypted_key');
-
-  let masterB64;
+  /**
+   * 维护者审查意见：%TEMP% 下这个是 Cookies 的**明文副本**，任何退出路径都必须删。
+   * 以前只在成功分支末尾删一次 —— DPAPI 失败、没 sessionid、库被占用这些抛错路径
+   * 会把明文 cookie 留在磁盘上。现在整段包进 try/finally。
+   */
   try {
-    masterB64 = await ps("Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String('" + ek.toString('base64') +
-      "'); [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser'))", 20000);
-  } catch (e) {
-    log('DPAPI 解密（PowerShell）不可用：' + e.message + '，尝试 _pc_cookie.json 兜底 …');
-    if (trySessionFromJson()) return {};
-    throw new Error('DPAPI 解密失败且无兜底：' + e.message);
-  }
-  const master = Buffer.from(masterB64, 'base64');
+    fs.copyFileSync(lsPath, path.join(tmp, 'LocalState.json'));
+    try { fs.copyFileSync(ckPath, path.join(tmp, 'Cookies')); }
+    catch (e) { throw new Error('Cookies 库被占用 —— 请先完全退出汽水音乐客户端再试'); }
 
-  const { DatabaseSync } = require('node:sqlite');
-  const db = new DatabaseSync(path.join(tmp, 'Cookies'));
-  const rows = db.prepare('SELECT host_key, name, value, encrypted_value FROM cookies').all();
-  db.close();
+    const ls = JSON.parse(fs.readFileSync(path.join(tmp, 'LocalState.json'), 'utf8'));
+    const ek = Buffer.from(ls.os_crypt.encrypted_key || '', 'base64').subarray(5);
+    if (!ek.length) throw new Error('Local State 无 encrypted_key');
 
-  function dec(enc) {
-    if (!enc || !enc.length) return '';
-    const buf = Buffer.from(enc);
-    const tag = buf.toString('latin1', 0, 3);
-    if (tag === 'v10' || tag === 'v20') {
-      const nonce = buf.subarray(3, 15), ct = buf.subarray(15);
-      const d = crypto.createDecipheriv('aes-256-gcm', master, nonce);
-      d.setAuthTag(ct.subarray(ct.length - 16));
-      let out = Buffer.concat([d.update(ct.subarray(0, ct.length - 16)), d.final()]);
-      if (tag === 'v20' && out.length > 32) out = out.subarray(32);
-      return out.toString('utf8');
+    let masterB64;
+    try {
+      masterB64 = await ps("Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String('" + ek.toString('base64') +
+        "'); [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,'CurrentUser'))", 20000);
+    } catch (e) {
+      log('DPAPI 解密（PowerShell）不可用：' + e.message + '，尝试 _pc_cookie.json 兜底 …');
+      if (trySessionFromJson()) return {};
+      throw new Error('DPAPI 解密失败且无兜底：' + e.message);
     }
-    return buf.toString('utf8');
+    const master = Buffer.from(masterB64, 'base64');
+
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(tmp, 'Cookies'));
+    const rows = db.prepare('SELECT host_key, name, value, encrypted_value FROM cookies').all();
+    db.close();
+
+    function dec(enc) {
+      if (!enc || !enc.length) return '';
+      const buf = Buffer.from(enc);
+      const tag = buf.toString('latin1', 0, 3);
+      if (tag === 'v10' || tag === 'v20') {
+        const nonce = buf.subarray(3, 15), ct = buf.subarray(15);
+        const d = crypto.createDecipheriv('aes-256-gcm', master, nonce);
+        d.setAuthTag(ct.subarray(ct.length - 16));
+        let out = Buffer.concat([d.update(ct.subarray(0, ct.length - 16)), d.final()]);
+        if (tag === 'v20' && out.length > 32) out = out.subarray(32);
+        return out.toString('utf8');
+      }
+      return buf.toString('utf8');
+    }
+    const ck = {};
+    for (const r of rows) if (r.host_key === '.qishui.com') ck[r.name] = r.value || dec(r.encrypted_value);
+    if (!ck.sessionid) throw new Error('未找到 sessionid（客户端里还没登录？）');
+    const cookie = Object.entries(ck).map(([k, v]) => k + '=' + v).join('; ');
+    saveSessionCookie(cookie);
+    COOKIE = cookie;
+    sessHint = 'sessionid ' + String(ck.sessionid).slice(0, 10) + '… 共 ' + Object.keys(ck).length + ' 项';
+    log('已从客户端同步登录态 sessionid=' + String(ck.sessionid).slice(0, 10) + '…');
+    return ck;
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { }   // 明文副本，用完即删（含异常路径）
   }
-  const ck = {};
-  for (const r of rows) if (r.host_key === '.qishui.com') ck[r.name] = r.value || dec(r.encrypted_value);
-  if (!ck.sessionid) throw new Error('未找到 sessionid（客户端里还没登录？）');
-  const cookie = Object.entries(ck).map(([k, v]) => k + '=' + v).join('; ');
-  saveSessionCookie(cookie);
-  COOKIE = cookie;
-  sessHint = 'sessionid ' + String(ck.sessionid).slice(0, 10) + '… 共 ' + Object.keys(ck).length + ' 项';
-  log('已从客户端同步登录态 sessionid=' + String(ck.sessionid).slice(0, 10) + '…');
-  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { }   // 里面是 Cookies 明文副本，用完即删
-  return ck;
 }
 
 
@@ -751,10 +771,43 @@ async function fetchLyricOnly(trackId) {
       }
     } catch (e) { }
   }
+  await waitReady(20000);        // 启动竞态：登录态 / 签名器没好先等，别让宿主的歌词请求空手而归
   const { lyric } = await trackV2(trackId);
   fs.mkdirSync(lyricDir(), { recursive: true });
   fs.writeFileSync(f, lyric || '');
   return lyric || '';
+}
+
+/**
+ * 歌词用的轻量元信息（**不下载、不解密音频**）。
+ * -----------------------------------------------------------------------------
+ * 之前歌词接口走 ensureAudio()，为了拿一段 KRC 会把整首歌下载+解密一遍：
+ *   · 重启后第一次播歌时，歌词请求和「这首歌自己的取流」抢同一个签名/带宽，
+ *     宿主的歌词请求 25 秒超时 → 面板上留着**上一次关闭时那首**的歌词，
+ *     切下一首就好了（这首的音频此时已缓存），再切回来也正常。
+ * 现在只调 track_v2 拿 lyric / 标题，标题优先用曲库里已有的。
+ */
+async function ensureLyricMeta(trackId) {
+  trackId = safeTrackId(trackId);
+  const metaFile = path.join(cacheDir(), trackId + '.json');
+  if (fs.existsSync(metaFile)) {
+    try {
+      const m = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+      if (m && typeof m.lyric === 'string') return m;      // 已解密过：meta 里有歌词，直接用
+    } catch (e) { }
+  }
+  await waitReady(20000);        // 启动竞态：登录态 / 签名器还没好的话先等一会儿，别直接失败
+  const { track, lyric, translations } = await trackV2(trackId);
+  const known = CATALOG.tracks.get(String(trackId));
+  const meta = {
+    id: String(trackId),
+    name: (known && known.name) || track.name,
+    artists: (known && known.artists) || (track.artists || []).map(a => a.name),
+    lyric: lyric || '',
+    translations: translations === undefined ? null : translations,
+  };
+  try { fs.mkdirSync(lyricDir(), { recursive: true }); fs.writeFileSync(path.join(lyricDir(), trackId + '.txt'), meta.lyric); } catch (e) { }
+  return meta;
 }
 
 function pickItem(items) {
@@ -897,24 +950,53 @@ async function fetchRecommendedPlaylists(n) {
   return out.slice(0, n || 20);
 }
 
-/** 歌单广场（POST /luna/pc/feed/playlist-square）—— 听歌模式里的推荐歌单格子，items 全是 type=playlist。
- *  只取前 n 个（默认 10），每次刷新曲库重新拉、整体替换。曲目走通用的 /luna/pc/playlist/detail。 */
-async function fetchPlaylistSquare(n) {
-  const r = await rpcPost('/luna/pc/feed/playlist-square', { count: n || 10, is_first_request: true });
+/**
+ * 歌单广场（POST /luna/pc/feed/playlist-square）—— 听歌模式里的推荐歌单格子，items 全是 type=playlist。
+ * 曲目走通用的 /luna/pc/playlist/detail（用到时才拉）。
+ *
+ * 这个接口是**滚动推荐**：`offset` 分页有效，每次返回不同的歌单。所以不再固定 10 个，
+ * 而是按页拉到没有新歌单为止（默认最多 6 页 × 20 ≈ 100 个，去重后通常 60~80）。
+ * 想少拉就设环境变量 `SODA_SQUARE_PAGES`（独立运行才认，见「配置」一节的说明）。
+ */
+const SQUARE_PAGE = 20;
+const SQUARE_MAX_PAGES = Math.max(1, parseInt(process.env.SODA_SQUARE_PAGES || '6', 10));
+
+async function fetchPlaylistSquare(maxPages) {
+  const pages = Math.max(1, maxPages || SQUARE_MAX_PAGES);
   const out = [];
-  for (const it of (r.items || [])) {
-    const p = (it.entity && it.entity.playlist) || {};
-    if (!p.id) continue;
-    out.push({
-      id: String(p.id), name: p.title || p.name || '未命名',
-      count: p.count_tracks || p.track_count || 0,
-      cover: (p.url_cover && p.url_cover.uri) ? (() => {
-        const base = ((p.url_cover.urls && p.url_cover.urls[0]) || 'https://p3-luna.douyinpic.com/img/') + p.url_cover.uri;
-        return /~tplv|~crop/.test(base) ? base : base + '~tplv-b829550vbb-crop-center:800:800.jpg';
-      })() : '',
-    });
+  const seen = new Set();
+  for (let i = 0; i < pages; i++) {
+    let r;
+    try {
+      r = await rpcPost('/luna/pc/feed/playlist-square', {
+        count: SQUARE_PAGE,
+        offset: i * SQUARE_PAGE,
+        is_first_request: i === 0,
+      });
+    } catch (e) {
+      if (i === 0) throw e;          // 第一页就失败 → 交给上层记日志
+      break;                          // 后续页失败就用已有结果，不要把整份目录搞挂
+    }
+    const items = (r && r.items) || [];
+    if (!items.length) break;
+    let added = 0;
+    for (const it of items) {
+      const p = (it.entity && it.entity.playlist) || {};
+      if (!p.id || seen.has(String(p.id))) continue;
+      seen.add(String(p.id));
+      out.push({
+        id: String(p.id), name: p.title || p.name || '未命名',
+        count: p.count_tracks || p.track_count || 0,
+        cover: (p.url_cover && p.url_cover.uri) ? (() => {
+          const base = ((p.url_cover.urls && p.url_cover.urls[0]) || 'https://p3-luna.douyinpic.com/img/') + p.url_cover.uri;
+          return /~tplv|~crop/.test(base) ? base : base + '~tplv-b829550vbb-crop-center:800:800.jpg';
+        })() : '',
+      });
+      added++;
+    }
+    if (!added) break;                // 这一页全是重复 → 接口翻不动了
   }
-  return out.slice(0, n || 10);
+  return out;
 }
 
 async function fetchPlaylistTracks(pid) {
@@ -1370,7 +1452,7 @@ async function refreshCatalog(force) {
       if (rec.length) log('推荐歌单 ' + rec.length + ' 个');
     } catch (e) { log('推荐歌单失败: ' + e.message); }
     try {
-      const sq = await fetchPlaylistSquare(10);   // 歌单广场：只取 10 个，刷新时整体替换
+      const sq = await fetchPlaylistSquare();   // 歌单广场：翻页去重合并，刷新时整体替换
       for (const p of sq) {
         pls.push({ id: 'pl_' + p.id, name: p.name, count: p.count, cover: p.cover, srcId: p.id, tracks: null, square: true });
       }
@@ -1628,6 +1710,29 @@ function metaToTrack(m) {
   };
 }
 
+/**
+ * 曲目元信息，**不下载音频**。曲库里没有这条（刚启动 / 目录还没刷完）时 getSong 用它兜底 ——
+ * 以前兜底走 ensureAudio()，等于为了返回一个标题就把整首无损下载解密一遍，
+ * 重启后第一首歌要等十几秒，宿主的歌词 / 封面请求先超时。
+ */
+async function ensureTrackMeta(trackId) {
+  trackId = safeTrackId(trackId);
+  const known = CATALOG.tracks.get(String(trackId));
+  if (known) return known;
+  const metaFile = path.join(cacheDir(), trackId + '.json');
+  if (fs.existsSync(metaFile)) {
+    try { return metaToTrack(JSON.parse(fs.readFileSync(metaFile, 'utf8'))); } catch (e) { }
+  }
+  await waitReady(20000);
+  const { track } = await trackV2(trackId);
+  return metaToTrack({
+    id: String(trackId), name: track.name,
+    artists: (track.artists || []).map(a => a.name), artistIds: (track.artists || []).map(a => String(a.id)),
+    album: (track.album && track.album.name) || '', albumId: String((track.album && track.album.id) || ''),
+    cover: rawCoverOf(track), duration: track.duration || 0,
+  });
+}
+
 const ROUTES = {
   ping: async () => ({}),
   getLicense: async () => ({ license: { valid: true } }),
@@ -1692,7 +1797,7 @@ const ROUTES = {
   getSong: async (q) => {
     await refreshCatalog();
     let t = CATALOG.tracks.get(q.id);
-    if (!t) { t = metaToTrack(await ensureAudio(q.id)); catalogAdd(t); }
+    if (!t) { t = await ensureTrackMeta(q.id); catalogAdd(t); }
     return { song: songOf(t) };
   },
 
@@ -1825,14 +1930,14 @@ const ROUTES = {
     let t = [...CATALOG.tracks.values()].find(x => x.name === q.title && x.artists.join('/').includes(q.artist || '')) ;
     const id = q.id || (t && t.id);
     if (!id) return { lyrics: { artist: q.artist || '', title: q.title || '', value: '' } };
-    const m = await ensureAudio(id);
+    const m = await ensureLyricMeta(id);
     // 经典 Subsonic 的 value 是纯文本，Folia 会自查格式（detectTimedLyricFormat 认得 enhanced-lrc、
     // 不认得 krc）。所以这里给 enhanced-lrc：`[00:15.50]<00:15.50>肌<00:15.84>寒` —— 行级 + 逐字都能用。
     const en = enhancedLrcFrom(m.lyric);
     return { lyrics: { artist: (m.artists || []).join(' / '), title: m.name, value: en || lrcFrom(m.lyric) } };
   },
   getLyricsBySongId: async (q) => {
-    const m = await ensureAudio(q.id);
+    const m = await ensureLyricMeta(q.id);
     const s = krcToStructured(m.lyric);
     const sub = s.line.length ? s.line : openSubsonicLrc(m.lyric);
     const structuredLyrics = [{
@@ -2125,7 +2230,7 @@ const server = http.createServer(async (rq, rs) => {
   if (u.pathname === '/' || u.pathname === '/index.html') {
     if (!tokenOk(rq, q)) {
       rs.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return rs.end('需要令牌：请在模组日志里打开带 ?token=… 的地址');
+      return rs.end('需要令牌：令牌只经 rpc 交给模组前端，不写日志、也不进对外 URL');
     }
     rs.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return rs.end(UI_HTML);
@@ -2233,7 +2338,7 @@ const server = http.createServer(async (rq, rs) => {
   if (u.pathname === '/api/lyrics') {
     let out;
     try {
-      const m = await ensureAudio(q.id);
+      const m = await ensureLyricMeta(q.id);
       const raw = m.lyric || '';
       const isKrc = /^\[\d+,\d+\]/m.test(raw);
       out = { ok: !!raw, format: isKrc ? 'krc' : 'lrc', text: raw, title: m.name, artist: (m.artists || []).join(' / ') };
@@ -2307,6 +2412,16 @@ const server = http.createServer(async (rq, rs) => {
  *   opts.forceSessionSync 强制重新从汽水客户端提取登录态。
  */
 async function start(opts = {}) {
+  /**
+   * 嵌入宿主时**不认环境变量**（维护者审查意见）：`HOST=0.0.0.0` 会把服务暴露到局域网，
+   * `SUB_PASS` 会把数据面密码变成可猜的固定值，`SODA_NATIVE_DIR` 能把原生模块目录指到任意位置。
+   */
+  if (opts.embedded) {
+    EMBEDDED = true;
+    HOST = '127.0.0.1';
+    PORT = 4533;
+    SECRET = '';
+  }
   sweepTempCookies();
   // 路径：优先用宿主给的 getter（Folium 1.5+）；否则退回 opts.dataDir（独立运行 / 旧宿主）
   if (opts.resolvePaths) {
@@ -2338,8 +2453,16 @@ async function start(opts = {}) {
     server.listen(PORT, HOST, () => { server.removeListener('error', onErr); resolve(); });
   });
   log('就绪 → http://' + HOST + ':' + PORT);
-  log('Folia 里填：Navidrome 服务器 http://' + HOST + ':' + PORT + '　用户名 ' + USER + '　密码 ' + SECRET);
-  log('设置页（带令牌，仅本机可开）：http://' + HOST + ':' + PORT + '/?token=' + TOKEN);
+  if (EMBEDDED) {
+    // 维护者审查意见：日志里**不打** `/rest` 密码、也不打带令牌的设置页地址 ——
+    // 嵌进宿主后这份日志会进模组面板，还经常被用户整段贴到 issue 里。
+    // 密码在数据目录的 auth.json（模组会自动写进宿主的 Navidrome 配置），令牌只经 rpc 给模组前端。
+    log('Folia 里填：Navidrome 服务器 http://' + HOST + ':' + PORT + '　用户名 ' + USER + '　密码 ******（已自动写入宿主，见数据目录 auth.json）');
+    log('设置页：http://' + HOST + ':' + PORT + '/ （需启动令牌，令牌只经 rpc 交给模组前端，不写日志）');
+  } else {
+    log('Folia 里填：Navidrome 服务器 http://' + HOST + ':' + PORT + '　用户名 ' + USER + '　密码 ' + SECRET);
+    log('设置页（带令牌，仅本机可开）：http://' + HOST + ':' + PORT + '/?token=' + TOKEN);
+  }
 
   // ---- 后台初始化 ------------------------------------------------------------
   // 顺序不能乱：原生签名器 → 设备身份 → 登录态 → 曲库。每一步失败都只记日志，
