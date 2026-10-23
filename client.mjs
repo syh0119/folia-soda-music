@@ -1,18 +1,18 @@
 /**
- * 汽水音乐 → Folia 在线音源（Folium 模组 · omni.providers）
+ * 汽水音乐 → Folia 音源（Folium 模组 · Navidrome 通道）
  * =============================================================================
- * 作用：让「汽水音乐」出现在首页右下角的音源切换器里（不需要内置 provider 权限）。
- *       切换后首页搜索框 / 搜索浮层都搜汽水曲库，播放与歌词走本机音源服务。
+ * 作用：模组在 main 里跑一个本地 OpenSubsonic 服务，Folia 书库的「Navidrome（NAVI）」页签连它。
+ *       歌单 / 专辑 / 歌手 / 收藏 / 搜索 / 播放 / 逐字歌词全部走标准协议。
  *
- * 前置：本机跑着 folia-soda 的 soda_subsonic.js（默认 http://127.0.0.1:4533）。
- *       歌单/专辑浏览请用侧栏的 Navidrome（NAVI）页签——omni.providers 的歌单标签
- *       在 Folium v2 之前是占位，这是上游限制。
+ * ⚠️ **不再注册 omni.providers 音源**（2.3.3 起）。原因：一旦成为「当前在线音源」，
+ *    书库的「歌单」页签就会按 provider 渲染它没实现的 歌单/电台/专辑 板块，变成灰的、点不动；
+ *    而音源切换器又挂在那页签里，用户看起来就像「切不回去了」。宿主还会在恢复会话时
+ *    把激活音源对齐到上次那首歌的 provider —— 于是一启用模组就自动切成汽水。
+ *    现在只走 Navidrome 通道：没有灰页签，也不改宿主的音源选择。
  *
  * 接口依据：folia-major 的 src/mods/folium/contract.ts
  *   - folium.net.fetch(url, init) → { ok, status, headers, text(), json() }（json 是同步的！）
- *   - providers.register({ id, displayName, shortName, search, getSong, getAudioUrl, getLyrics })
- *   - getLyrics 返回 { main: { format, text } }，format 支持 'krc' / 'lrc' / 'enhanced-lrc' / 'ttml' …
- *     汽水的歌词原文就是 KRC，直接交给宿主即可原生逐字渲染。
+ *   - 歌词走 Subsonic 的 getLyrics / getLyricsBySongId（enhanced-lrc + cueLine）
  */
 'use strict';
 
@@ -108,9 +108,9 @@ export default function activate(folium) {
     label: { 'zh-CN': '汽水音乐', en: 'Soda Music' },
     description: {
       'zh-CN': '音源服务已内置在本模组里（main 启动时自动拉起），这里只调连接参数，改完即时生效。\n' +
-        '注意：右下角音源切换器里的「汽水音乐」只提供 搜索 / 播放 / 歌词 —— 它的「歌单、专辑、电台」三个标签是 ' +
-        'Folia 上游的占位（omni.providers 没有开放这些面，不是本模组没做）。\n' +
-        '要浏览汽水的歌单 / 专辑 / 歌手 / 收藏，请用书库里的「Navidrome」（NAVI）页签：它连的就是这个服务，' +
+        '本模组只走书库的「Navidrome」（NAVI）页签 —— 不注册首页音源切换器里的在线音源，' +
+        '所以不会出现「歌单页签变灰、切不回去」的情况。\n' +
+        '汽水的歌单 / 专辑 / 歌手 / 收藏都在 NAVI 页签里：它连的就是这个服务，' +
         '而且把切换器切回网易云之类的音源也不会消失。',
       en: 'The source server is bundled in this mod (started by main). Use the library\'s Navidrome tab to browse playlists / albums / artists.',
     },
@@ -245,6 +245,10 @@ export default function activate(folium) {
   });
 
   // ---------------------------------------------------------------- 注册音源
+  // 续播离不开它：宿主只会解析「自己发出去的 ref」，模组造不出可用 ref；
+  // 把这些歌追加进队列的唯一办法就是让它们属于一个已注册的 provider。
+  // 代价是它可能被宿主选成「当前在线音源」（会话恢复时会对齐到上次那首歌的来源），
+  // 那种状态下书库「歌单」页签会按 provider 渲染未实现的板块而变灰 —— 所以下面有 autoReleaseProvider()。
   folium.experimental['omni.providers'].register({
     id: 'soda',
     displayName: '汽水音乐',
@@ -334,6 +338,58 @@ export default function activate(folium) {
       }
     },
   });
+
+
+  /**
+   * 启动时检查「当前在线音源」是不是被宿主对齐成了汽水。
+   *
+   * 为什么会是汽水：宿主恢复上次会话时，会把当前音源对齐到那首歌的 provider
+   * （`[Session] Aligning active provider to restored song provider`）。续播追加的歌就是
+   * 本 provider 的，所以下次启动很容易落到「当前音源 = 汽水」。
+   *
+   * 一旦是汽水，书库「歌单」页签会按 provider 渲染它没实现的 歌单/电台/专辑 → 变灰、点不动。
+   * ⚠️ 宿主的「当前音源」是**运行时内存状态**，没有给模组开放 setter（internals 里只有
+   *    playback / appView / visualizerSettings / themeSettings / lyricSettings 五个 store，
+   *    `internals.omni` 是只读的 provider 服务）。所以这里只能：能改就当场改，改不了就明确
+   *    提示用户去首页右下角的音源切换器点回网易云（一次点击，当场恢复）。
+   */
+  const autoReleaseProvider = () => {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      const stored = localStorage.getItem('active_online_provider_id');
+      if (stored !== PROVIDER_ID) return;
+
+      let live = false;
+      try {
+        const it = folium.internals || {};
+        const cands = [
+          it.omni,
+          it.stores && it.stores.omni,
+          it.stores && it.stores.onlineProviders,
+          it.stores && it.stores.providerSettings,
+        ].filter(Boolean);
+        for (const c of cands) {
+          const st = (typeof c.getState === 'function' ? c.getState() : c);
+          if (st && typeof st.setActiveProviderId === 'function') { st.setActiveProviderId('netease'); live = true; break; }
+        }
+      } catch (e) { }
+
+      // localStorage 只管下次启动（下次宿主仍会按恢复的歌重新对齐），但留着比坏着好
+      try { localStorage.setItem('active_online_provider_id', 'netease'); } catch (e) { }
+
+      if (live) {
+        say('当前音源已被宿主对齐成汽水，已自动交还网易云');
+        try { folium.ui.toast('汽水音乐：已自动把当前音源交还网易云，书库「歌单」页签可正常使用。', { type: 'info', durationMs: 8000 }); } catch (e) { }
+      } else {
+        say('当前音源被宿主对齐成汽水（书库歌单页签会变灰）—— 本模组无法从代码里改宿主的音源选择');
+        try {
+          folium.ui.toast('汽水音乐：当前音源是汽水，书库「歌单」页签会变灰。' +
+            '去首页右下角的音源切换器点回「网易云」即可恢复（每次启动一次）。',
+            { type: 'info', durationMs: 15000 });
+        } catch (e) { }
+      }
+    } catch (e) { }
+  };
 
   // ============================================================ 无限续播（追队列版）
   // 第一版用的是 Folia 的私人 FM：接管 omni.getPersonalFm + setIsFmMode(true)。
@@ -467,6 +523,9 @@ export default function activate(folium) {
         + (viaApi ? '（走公开 enqueue）' : '（退回内部 store）')
         + (got.source ? '，跟着「' + got.source + '」'
                       : '（通用推荐流；当前曲目 id=' + (curId || '拿不到') + '）'));
+      // 续上的第一批里第一首马上就要播：提前取流，别让「首字节要等整首下完」变成播放错误
+      const firstId = ourIdOf(songs[0]);
+      if (firstId) apiFetch('/api/prefetch?id=' + encodeURIComponent(firstId), { timeoutMs: 8000 }).catch(() => { });
     };
     if (fmTimer) return;
     flagsSet('endless', 1);
@@ -626,6 +685,39 @@ export default function activate(folium) {
       prefetchLines(id);                            // 还没备好：这次先让兜底上，下次生效
     }
   });
+
+  // ============================================================ 预取下一首
+  /**
+   * 「后台老是停止播放 / 播放错误」的根因：我们的取流要先把**整首**下载 + 解密
+   * 才能吐出第一个字节（无损 30–60 MB），冷启动那首要 5–25 秒，宿主等不及就报错、跳歌。
+   * 宿主给了队列和当前位次，所以提前把**下一首**拉进缓存 —— 轮到它播时首字节 ≈ 0。
+   * 只有普通播放队列能预测；私人 FM / 外部舞台（kind !== 'queue'）跳过。
+   */
+  let prefetchTimer = null;
+  const prefetchNext = () => {
+    clearTimeout(prefetchTimer);
+    prefetchTimer = setTimeout(async () => {
+      try {
+        const q = folium.playback.getQueue({ limit: 3 });
+        if (!q || q.kind !== 'queue' || q.currentIndex < 0) return;
+        const next = (q.items || []).find(it => it.index === q.currentIndex + 1);
+        const id = next && ourSongId(next.song);
+        if (!id) return;
+        await apiFetch('/api/prefetch?id=' + encodeURIComponent(id), { timeoutMs: 8000 });
+      } catch (e) { /* 队列还没就绪 / 旧宿主没有 getQueue：预取只是优化，失败不打扰用户 */ }
+    }, 1500);   // 等宿主把队列与音源状态稳定下来再问
+  };
+  folium.events.on('playback.songChanged', prefetchNext);
+  folium.events.on('playback.queueChanged', prefetchNext);
+
+  // 宿主的播放失败通知：记一行日志，方便在模组面板看是哪一步失败的（不自动重试，宿主会按自己的策略跳过）
+  try {
+    folium.events.on('playback.failed', (e) => {
+      const t = (e && e.song && e.song.title) || '?';
+      say('播放失败[' + ((e && e.phase) || '?') + '] ' + t + ' · ' + ((e && e.reason) || '?') +
+        (e && e.willAutoSkip ? ' · 宿主会自动跳过' : ''));
+    });
+  } catch (e) { }
 
   // ============================================================ 锁定渲染帧率
   // Folia 的限帧器在 utils/frameRateLimiter.ts，通过 useVisualizerSettingsStore 暴露，
@@ -1054,6 +1146,9 @@ export default function activate(folium) {
         const c = (h && h.catalog) || {};
         say('音源服务在线 ' + base() + ' · ' + (c.tracks || 0) + ' 曲 / ' +
           (c.playlists || 0) + ' 歌单 · 登录态 ' + (h.loggedIn ? '已就绪' : '未获取'));
+        // 宿主可能刚把「当前音源」对齐成了汽水（上次那首歌来自本 provider）——立刻交还，
+        // 否则书库「歌单」页签会灰掉。
+        autoReleaseProvider();
         if (ensureNavidromePreset()) {
           try { folium.ui.toast('汽水音乐：已把书库的 Navidrome 指到本机音源。若 NAVI 页签还没出现，重启一次 Folia。', { type: 'info', durationMs: 9000 }); } catch (e) { }
         }

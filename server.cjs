@@ -41,6 +41,7 @@ const { spawn, execFileSync } = require('child_process');
  * 环境变量只对独立运行（`node soda_subsonic.js`）生效。
  */
 let EMBEDDED = false;
+let LAN_MODE = false;
 let PORT = parseInt(process.env.PORT || '4533', 10);
 let HOST = process.env.HOST || '127.0.0.1';
 /** 系统目录下的可执行文件全路径 —— 不按名字走 PATH（同名程序可以劫持） */
@@ -101,6 +102,28 @@ function dataDir() {
   try { fs.mkdirSync(d, { recursive: true }); } catch (e) { }
   return d;
 }
+
+/** 用户设置（持久化到数据目录 settings.json） */
+const SETTINGS_FILE = () => path.join(dataDir(), 'settings.json');
+const SETTINGS_DEFAULTS = { trialDetect: false };
+let SETTINGS = null;
+function loadSettings() {
+  if (SETTINGS) return SETTINGS;
+  const d = Object.assign({}, SETTINGS_DEFAULTS);
+  try { Object.assign(d, JSON.parse(fs.readFileSync(SETTINGS_FILE(), 'utf8')) || {}); } catch (e) { }
+  SETTINGS = d;
+  return SETTINGS;
+}
+function saveSettings(patch) {
+  const s2 = Object.assign(loadSettings(), patch || {});
+  SETTINGS = s2;
+  try {
+    fs.mkdirSync(path.dirname(SETTINGS_FILE()), { recursive: true });
+    fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(s2, null, 1));
+  } catch (e) { }
+  return s2;
+}
+const trialEnabled = () => !!loadSettings().trialDetect;
 
 /** 可重建的缓存目录（被用户清空后能自建） */
 function cacheDir() {
@@ -517,7 +540,6 @@ async function refreshSessionFromClient() {
   }
 }
 
-
 /** 启动时清扫历史残留：同步登录态会在 %TEMP% 下拷一份 Cookies，旧版本用完没删 */
 function sweepTempCookies() {
   try {
@@ -732,7 +754,7 @@ function getBuf(url, extraHeaders, maxRedirect = 5) {
 }
 
 /** track_v2 → 原始 track 元数据 + 歌词 + 各档位流信息 */
-async function trackV2(trackId) {
+async function trackV2Raw(trackId) {
   trackId = safeTrackId(trackId);
   const body = JSON.stringify({ track_id: String(trackId), media_type: 'track', queue_type: 'daily_mix', scene_name: 'track_reco' });
   const url = buildUrl('/luna/pc/track_v2');
@@ -810,6 +832,24 @@ async function ensureLyricMeta(trackId) {
   return meta;
 }
 
+/**
+ * trackV2 的 60 秒短缓存。
+ * 为什么需要：取流路径现在会先问一次「这首是不是无损档」（tryStreamFlac），
+ * 走整首兜底时 ensureAudio 又要同样的数据 —— 两次 track_v2 各 ~250ms，
+ * 首字节直接多出半秒。缓存只留在内存里，过期即失效，不加任何一致性负担。
+ */
+const TV2_MEMO = new Map();
+function trackV2(trackId) {
+  const key = String(trackId);
+  const hit = TV2_MEMO.get(key);
+  if (hit && Date.now() - hit.at < 60000) return hit.p;
+  const p = trackV2Raw(trackId);
+  TV2_MEMO.set(key, { at: Date.now(), p });
+  p.catch(() => TV2_MEMO.delete(key));
+  if (TV2_MEMO.size > 500) TV2_MEMO.delete(TV2_MEMO.keys().next().value);
+  return p;
+}
+
 function pickItem(items) {
   if (!items || !items.length) throw new Error('无可用流');
   if (QUALITY === 'best') {
@@ -839,43 +879,137 @@ function rawCoverOf(tr) {
   return base + c.uri + '~' + (c.template_prefix || 'tplv-b829550vbb') + '-crop-center:800:800.jpg';
 }
 
+/**
+ * 「试听片段」检测（可选功能，默认关闭，开关在模组面板）。
+ * 汽水 VIP 到期后 **PC 链路**只下发 30~60 秒试听档（手机端仍是完整版）。
+ * 开启后：取流时对比真实时长 / 文件体积，命中即记入数据目录 `_trial.json`；
+ * 歌单与搜索里歌名加「（试听）」后缀，续播默认跳过；整批都是试听时兜底放行。
+ */
+const TRIAL_FILE = () => path.join(dataDir(), '_trial.json');
+let TRIAL_IDS = null;
+function loadTrials() {
+  if (TRIAL_IDS) return TRIAL_IDS;
+  TRIAL_IDS = new Set();
+  try { TRIAL_IDS = new Set(JSON.parse(fs.readFileSync(TRIAL_FILE(), 'utf8')) || []); } catch (e) { }
+  return TRIAL_IDS;
+}
+/** 开关关闭时一律视为非试听，历史缓存也不生效 */
+function isTrial(id) {
+  if (!trialEnabled()) return false;
+  return loadTrials().has(String(id));
+}
+function markTrial(id) {
+  if (!trialEnabled()) return false;
+  const set = loadTrials();
+  const k = String(id);
+  if (set.has(k)) return false;
+  set.add(k);
+  try { fs.writeFileSync(TRIAL_FILE(), JSON.stringify([...set])); } catch (e) { }
+  return true;
+}
+
+/**
+ * mp4/m4a 的 mvhd 时长（毫秒）；认不出返回 0。
+ * 偏移相对 **盒起始**：type 在 i 时，version 在 i+4、v0 timescale 在 i+16、duration 在 i+20。
+ */
+function mp4DurationMs(buf) {
+  try {
+    for (let i = 0; i + 44 <= buf.length; i++) {
+      if (buf.readUInt32BE(i) !== 0x6D766864) continue;        // 'mvhd'
+      const v = buf[i + 4];
+      if (v === 1) return Number(buf.readBigUInt64BE(i + 28)) / buf.readUInt32BE(i + 24) * 1000;
+      return buf.readUInt32BE(i + 20) / buf.readUInt32BE(i + 16) * 1000;
+    }
+  } catch (e) { }
+  return 0;
+}
+/** flac 的 STREAMINFO 时长（毫秒）；认不出返回 0 */
+function flacDurationMs(buf) {
+  try {
+    if (buf.length < 42 || buf.toString('latin1', 0, 4) !== 'fLaC') return 0;
+    // 'fLaC'(4) + 块头(4) + min/max block(4) + min/max frame(6) = 18
+    const packed = buf.readBigUInt64BE(18);
+    const rate = Number(packed >> 44n);
+    const total = Number(packed & 0xFFFFFFFFFn);
+    return rate ? total / rate * 1000 : 0;
+  } catch (e) { }
+  return 0;
+}
+/** 按文件内容判断格式（不看扩展名，试听档和整曲可能不同） */
+function audioDurationMs(buf) {
+  if (!buf || buf.length < 16) return 0;
+  if (buf.toString('latin1', 0, 4) === 'fLaC') return flacDurationMs(buf);
+  return mp4DurationMs(buf);
+}
+
 /** 取流 + 解密 + 落盘缓存 */
+const AUDIO_INFLIGHT = new Map();        // id -> promise：同一个 id 的并发请求只做一次下载/解密
 async function ensureAudio(trackId) {
   trackId = safeTrackId(trackId);
   const metaFile = path.join(cacheDir(), trackId + '.json');
   const hit = fs.existsSync(metaFile) ? JSON.parse(fs.readFileSync(metaFile, 'utf8')) : null;
   if (hit && fs.existsSync(path.join(cacheDir(), hit.file))) return hit;
 
-  const { track, lyric, translations, items } = await trackV2(trackId);
-  const pick = pickItem(items);
-  const kr = await hostCall('decodeSpade', { spade: pick.spade_a });
-  // decrypt() 要的是 hex 字符串；原生模块正常回字符串，万一回 Buffer 就按 latin1 还原
-  const key = kr.kind === 'string' ? kr.text : Buffer.from(kr.b64, 'base64').toString('latin1');
-  let coverBuf = null;
-  const cu = coverUrlOf(track);
-  if (cu) { try { coverBuf = await getBuf(cu); } catch (e) { } }
-  const enc = await getBuf(pick.main_url);
-  const r = CORE.decrypt(enc, key, {
-    title: track.name,
-    artist: (track.artists || []).map(a => a.name).join(' / '),
-    album: (track.album || {}).name || '',
-    lyric, coverBuf,
-  });
-  const fname = trackId + r.ext;
-  sweepCache();   // 落盘前兜一下容量上限
-  fs.writeFileSync(path.join(cacheDir(), fname), r.data);
-  const meta = {
-    id: String(trackId), file: fname, ext: r.ext, kind: r.kind, quality: pick.quality,
-    name: track.name, artists: (track.artists || []).map(a => a.name),
-    artistIds: (track.artists || []).map(a => String(a.id)),
-    album: (track.album || {}).name || '', albumId: String((track.album || {}).id || ''),
-    cover: rawCoverOf(track), lyric,
-    translations: translations || null,
-    duration: track.duration || 0,
-  };
-  fs.writeFileSync(metaFile, JSON.stringify(meta));
-  log('取流完成 ' + meta.name + ' [' + meta.quality + '] ' + (r.data.length / 1048576).toFixed(1) + 'MB');
-  return meta;
+  // 单飞：宿主取流 / 预取 / 歌词兜底可能同时要同一首，重复下载既慢又浪费带宽
+  const pending = AUDIO_INFLIGHT.get(trackId);
+  if (pending) return pending;
+  const job = (async () => {
+    const t0 = Date.now();
+    const { track, lyric, translations, items } = await trackV2(trackId);
+    const t1 = Date.now();
+    const pick = pickItem(items);
+    const kr = await hostCall('decodeSpade', { spade: pick.spade_a });
+    const t2 = Date.now();
+    // decrypt() 要的是 hex 字符串；原生模块正常回字符串，万一回 Buffer 就按 latin1 还原
+    const key = kr.kind === 'string' ? kr.text : Buffer.from(kr.b64, 'base64').toString('latin1');
+    let coverBuf = null;
+    const cu = coverUrlOf(track);
+    if (cu) { try { coverBuf = await getBuf(cu); } catch (e) { } }
+    const enc = await getBuf(pick.main_url);
+    const t3 = Date.now();
+    const r = CORE.decrypt(enc, key, {
+      title: track.name,
+      artist: (track.artists || []).map(a => a.name).join(' / '),
+      album: (track.album || {}).name || '',
+      lyric, coverBuf,
+    });
+    const fname = trackId + r.ext;
+    // 试听判定（开关开启时才做）：真实时长 < min(90s, 官方 60%)，或体积 < 按码率推算的一半
+    let trial = false;
+    if (trialEnabled()) {
+      try {
+        const declared = Number(track.duration || 0);
+        const real = audioDurationMs(r.data);
+        if (real > 0 && declared > 0 && real < Math.min(90000, declared * 0.6)) trial = true;
+        if (!trial && declared > 0) {
+          const br = Number(pick.br || 0);
+          const expect = br > 0 ? declared / 1000 * br * 1000 / 8 : 0;
+          if (expect > 0 && r.data.length < expect * 0.5) trial = true;
+        }
+        if (trial && markTrial(trackId)) log('试听片段：' + track.name
+          + (real ? '（实际 ' + (real / 1000).toFixed(0) + 's）' : '')
+          + ' / 官方 ' + (declared / 1000).toFixed(0) + 's —— PC 链路只给了试听档');
+      } catch (e) { }
+    }
+    sweepCache();   // 落盘前兜一下容量上限
+    fs.writeFileSync(path.join(cacheDir(), fname), r.data);
+    const meta = {
+      id: String(trackId), file: fname, ext: r.ext, kind: r.kind, quality: pick.quality, trial,
+      name: track.name, artists: (track.artists || []).map(a => a.name),
+      artistIds: (track.artists || []).map(a => String(a.id)),
+      album: (track.album || {}).name || '', albumId: String((track.album || {}).id || ''),
+      cover: rawCoverOf(track), lyric,
+      translations: translations || null,
+      duration: track.duration || 0,
+    };
+    fs.writeFileSync(metaFile, JSON.stringify(meta));
+    log('取流完成 ' + meta.name + ' [' + meta.quality + '] ' + (r.data.length / 1048576).toFixed(1) + 'MB');
+    log('耗时 → track_v2 ' + (t1 - t0) + 'ms / decodeSpade ' + (t2 - t1) + 'ms / 下载 ' + (t3 - t2) + 'ms ('
+      + (enc.length / 1048576).toFixed(1) + 'MB) / 解密 ' + (Date.now() - t3) + 'ms');
+    return meta;
+  })().finally(() => AUDIO_INFLIGHT.delete(trackId));
+  AUDIO_INFLIGHT.set(trackId, job);
+  return job;
 }
 
 // ============================================================ 曲库来源
@@ -1267,9 +1401,11 @@ async function takeFromContext(seedId, n) {
  */
 async function serveFromPlaylists(plIds, seedId, n, usedName, info) {
   const out = [];
+  const trialSkipped = [];
   const take = (t) => {
     const id = String(t.id);
     if (feedPool.seen.has(id)) return false;
+    if (isTrial(id)) { trialSkipped.push(t); return false; }   // 试听档不进队（开关关闭时恒为 false）
     feedPool.seen.add(id);
     const qi = feedPool.q.findIndex(x => String(x.id) === id);
     if (qi >= 0) feedPool.q.splice(qi, 1);
@@ -1289,6 +1425,12 @@ async function serveFromPlaylists(plIds, seedId, n, usedName, info) {
     if (out.length >= n) break;
   }
   info.pool = pool.length;
+  info.trialSkipped = trialSkipped.length;
+  // 候选全是试听片段（VIP 整个到期）：宁可不完整，也别让续播断掉
+  if (!out.length && trialSkipped.length) {
+    for (const t of trialSkipped) { if (out.length >= n) break; take(t); }
+    info.trialFallback = true;
+  }
 
   // 2) 歌单取完 → 按种子拉同风格的歌。**多轮换种子**：一次 related 只回十几个 item，
   //    而且用同一批种子要回来的基本是同一批（会被去重挡掉），所以每轮都重新随机抽种子。
@@ -1580,7 +1722,8 @@ function songOf(t) {
   // 墙（Bravais）和歌手详情头图是直接渲染 coverUrl 的 —— 空串 = 那块纯空白。
   // 所以这里一路兜到「占位 id」，由 getCoverArt 现画一张带名字的 SVG。
   return {
-    id: t.id, parent: t.albumId || '0', isDir: false, title: t.name, album: t.album || '',
+    id: t.id, parent: t.albumId || '0', isDir: false,
+    title: t.name + (isTrial(t.id) ? '（试听）' : ''), album: t.album || '',
     artist: t.artists.join(' / '), track: 0, year: 0, genre: '', coverArt: coverOrPlaceholder(t),
     size: 0, contentType: 'audio/flac', suffix: 'flac', duration: Math.round(((t.duration || 0) || 0) / 1000),
     created: new Date().toISOString(), albumId: t.albumId || '', artistId: t.artistIds[0] || '',
@@ -1731,6 +1874,157 @@ async function ensureTrackMeta(trackId) {
     album: (track.album && track.album.name) || '', albumId: String((track.album && track.album.id) || ''),
     cover: rawCoverOf(track), duration: track.duration || 0,
   });
+}
+
+// ============================================================ 分块取流（无损 FLAC）
+/**
+ * 无损单曲 30–60 MB，整首下完再解密才吐第一个字节 = 首字节 5–25 秒，宿主/手机播放器直接超时。
+ * 这里改成「边下边解密边发」：
+ *   · 汽水的加密容器是 MP4 + 逐样本 AES-128-CTR（每个样本一个 IV），样本之间互不依赖
+ *   · FLAC 的输出 = fLaC 头（从 moov/dfLa 重建）+ 逐样本解密后的帧
+ *   · 所以只要 moov 在样本之前（faststart），就能先发头、再顺着样本流发
+ * 只在「无损档 + 没有缓存 + 非 Range 请求」时走这条路；其它情况一律回退到整首下载。
+ */
+
+/** 上游按区间取一段（CDN 支持 Range） */
+function httpRangeBytes(url, start, end, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = assertFetchable(url);
+    const req = https.get({
+      hostname: u.hostname, path: u.pathname + u.search, timeout: timeoutMs || 20000,
+      headers: { 'user-agent': UA, Range: 'bytes=' + start + '-' + end },
+    }, (r) => {
+      const chunks = [];
+      r.on('data', (c) => chunks.push(c));
+      r.on('end', () => resolve({ status: r.statusCode, buf: Buffer.concat(chunks) }));
+    });
+    req.on('timeout', () => req.destroy(new Error('取头部超时')));
+    req.on('error', reject);
+  });
+}
+
+/**
+ * 尝试分块输出无损 FLAC。
+ * 返回 true 表示响应已完整写完；false 表示这条曲子不适合流式（调用方回退整首）。
+ * 抛错表示流式过程中失败：调用方若还没发头就回退，已经开始发就只能断开让播放器重试。
+ */
+async function tryStreamFlac(id, res) {
+  if (AUDIO_INFLIGHT.has(id)) return false;                       // 已有整首在下载，不抢
+  const metaFile = path.join(cacheDir(), id + '.json');
+  if (fs.existsSync(metaFile)) return false;                      // 命中缓存：走原来的文件服务
+
+  const t0 = Date.now();
+  const { track, lyric, translations, items } = await trackV2(id);
+  const pick = pickItem(items);
+  if (!pick || !/^(lossless|hi_res)$/.test(String(pick.quality))) return false;
+
+  // 封面和头部并行取：封面只影响标签，不该拖慢首字节
+  const cu = coverUrlOf(track);
+  const coverP = cu ? getBuf(cu).catch(() => null) : Promise.resolve(null);
+
+  const kr = await hostCall('decodeSpade', { spade: pick.spade_a });
+  const keyHex = kr.kind === 'string' ? kr.text : Buffer.from(kr.b64, 'base64').toString('latin1');
+  const key = Buffer.from(keyHex, 'hex');
+  if (key.length !== 16) return false;
+
+  // 1) 先取前 2MB 找 moov（样本表 / IV 表都在里面）
+  const head = await httpRangeBytes(pick.main_url, 0, 2097152 - 1);
+  if (head.status !== 200 && head.status !== 206) return false;
+  const hb = head.buf;
+  let p = 0, moovEnd = 0, mdatPos = 0;
+  while (p + 8 <= hb.length) {
+    const sz = hb.readUInt32BE(p);
+    if (sz < 8) break;
+    const t = hb.toString('latin1', p + 4, p + 8);
+    if (t === 'moov') {
+      if (p + sz > hb.length) return false;                       // moov 比 2MB 还大：不折腾
+      moovEnd = p + sz;
+    }
+    if (t === 'mdat' && !mdatPos) mdatPos = p;
+    p += sz;
+  }
+  if (!moovEnd) return false;
+  if (mdatPos && mdatPos < moovEnd) return false;                 // mdat 在 moov 之前 → 没法先发头
+  if (CORE.classify(hb) !== 'flac') return false;
+
+  const table = CORE.parseTrack(hb);
+  const ivs = CORE.parseIvs(hb);
+  const n = Math.min(table.length, ivs.length);
+  if (!n) return false;
+  let contiguous = true, expect = table[0][0];
+  for (let i = 0; i < n; i++) {
+    if (table[i][0] !== expect) { contiguous = false; break; }
+    expect += table[i][1];
+  }
+  if (!contiguous) return false;                                  // 样本不连续：按顺序读会对不上
+
+  // 2) 头部：fLaC + STREAMINFO（+ 文本标签，封面不嵌，省一次下载）
+  const coverBuf = await coverP;                 // 通常此时已经回来了（与头部并行）
+  const header = CORE.flacEmbed(CORE.flacMetaBlocks(hb), {
+    TITLE: track.name || '',
+    ARTIST: (track.artists || []).map((a) => a.name).join(' / '),
+    ALBUM: (track.album || {}).name || '',
+    LYRICS: CORE.krcToLrc(CORE.fixMojibake(lyric || '')),
+  }, coverBuf);
+  const total = header.length + expect - table[0][0];
+  const firstOff = table[0][0], lastOff = expect;
+
+  res.writeHead(200, { 'Content-Type': 'audio/flac', 'Content-Length': total, 'Accept-Ranges': 'none' });
+  res.write(header);
+
+  const tmp = path.join(cacheDir(), id + '.flac.part');
+  const ws = fs.createWriteStream(tmp);
+  ws.write(header);                     // 落盘文件也要带头，否则缓存下来的是「没有 fLaC 头的裸帧」
+  let written = 0;
+
+  // 3) 顺序流：样本在加密文件里是连着的，一次 Range 拿整段，按样本大小切
+  await new Promise((resolve, reject) => {
+    const u = assertFetchable(pick.main_url);
+    const req = https.get({
+      hostname: u.hostname, path: u.pathname + u.search, timeout: 30000,
+      headers: { 'user-agent': UA, Range: 'bytes=' + firstOff + '-' + (lastOff - 1) },
+    }, (r) => {
+      if (r.statusCode !== 206 && r.statusCode !== 200) { r.resume(); return reject(new Error('HTTP ' + r.statusCode)); }
+      let pending = Buffer.alloc(0), si = 0;
+      const pump = () => {
+        while (si < n) {
+          const size = table[si][1];
+          if (pending.length < size) return;
+          const enc = pending.subarray(0, size);
+          pending = pending.subarray(size);
+          const out = CORE.ctr(key, ivs[si], enc);
+          res.write(out);
+          ws.write(out);
+          written += size;
+          si += 1;
+        }
+        r.destroy();
+        resolve();
+      };
+      r.on('data', (c) => { pending = pending.length ? Buffer.concat([pending, c]) : c; pump(); });
+      r.on('end', () => { if (si >= n) resolve(); else reject(new Error('上游提前结束 ' + si + '/' + n)); });
+      r.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('取流超时')));
+    req.on('error', reject);
+  });
+
+  await new Promise((r2) => ws.end(r2));
+  fs.renameSync(tmp, path.join(cacheDir(), id + '.flac'));
+  const meta = {
+    id: String(id), file: id + '.flac', ext: '.flac', kind: 'flac', quality: pick.quality,
+    name: track.name, artists: (track.artists || []).map((a) => a.name),
+    artistIds: (track.artists || []).map((a) => String(a.id)),
+    album: (track.album || {}).name || '', albumId: String((track.album || {}).id || ''),
+    cover: rawCoverOf(track), lyric: lyric || '',
+    translations: translations || null,
+    duration: track.duration || 0,
+    streamed: true,                       // 分块写出来的：标签只有文本，没有封面
+  };
+  fs.writeFileSync(metaFile, JSON.stringify(meta));
+  sweepCache();
+  log('分块流完成 ' + meta.name + ' ' + (written / 1048576).toFixed(1) + 'MB · 首字节 ' + (Date.now() - t0) + 'ms');
+  return true;
 }
 
 const ROUTES = {
@@ -2007,6 +2301,16 @@ const ROUTES = {
     }
   },
   stream: async (q, res, reqObj) => {
+    const streamId = safeTrackId(q.id);
+    // 无损：边下边解密边发（Range 请求与已有缓存不走这条）
+    if (!reqObj.headers.range) {
+      try {
+        if (await tryStreamFlac(streamId, res)) return undefined;
+      } catch (e) {
+        if (res.headersSent) { try { res.destroy(); } catch (x) { } return undefined; }
+        log('分块流回退整首: ' + e.message);
+      }
+    }
     const m = await ensureAudio(q.id);
     // 缓存文件名是我们自己写的（<id>.<ext>）；这里再挡一道，别让被篡改的 meta 把路径带出去
     if (!/^\d{1,32}\.[A-Za-z0-9]{1,8}$/.test(String(m.file || ''))) throw { code: 70, message: 'bad cache entry' };
@@ -2200,8 +2504,16 @@ const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
 function hostAllowed(h) {
   const raw = String(h || '').trim().toLowerCase();
   const m = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(raw);
-  if (!m || !LOOPBACK.has(m[1])) return false;
-  return !m[2] || Number(m[2]) === PORT;
+  if (!m) return false;
+  const host = m[1];
+  const okPort = !m[2] || Number(m[2]) === PORT;
+  if (LOOPBACK.has(host)) return okPort;
+  // 局域网模式（显式开关）：允许内网地址访问，但仍然是「本机内网 IP」，不接受公网域名/地址
+  if (LAN_MODE && okPort) {
+    if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) return true;
+    if (host === 'localhost' || host.endsWith('.local')) return true;
+  }
+  return false;
 }
 
 /** 控制面令牌：每次启动随机生成，经 rpc 交给本模组自己的 client（不落盘、不进 URL）。 */
@@ -2347,6 +2659,42 @@ const server = http.createServer(async (rq, rs) => {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
     return rs.end(body);
   }
+  if (u.pathname === '/api/prefetch') {
+    /**
+     * 后台预取：把整首下载 + 解密提前做掉，轮到它播时首字节 ≈ 0。
+     * 「后台老是停止播放 / 播放错误」就是首字节太慢：无损 30–60 MB 要整首下完才能吐第一个字节，
+     * 冷启动那首 5–25 秒，宿主等不及就报错跳歌。冷启动那首没法提前，但连播下一首可以。
+     */
+    let out;
+    try {
+      const id = safeTrackId(q.id);
+      const metaFile = path.join(cacheDir(), id + '.json');
+      let cached = false;
+      if (fs.existsSync(metaFile)) {
+        try { cached = fs.existsSync(path.join(cacheDir(), JSON.parse(fs.readFileSync(metaFile, 'utf8')).file || '')); } catch (e) { }
+      }
+      if (!cached) ensureAudio(id).catch(e => log('预取失败 ' + id + ': ' + e.message));
+      out = { ok: true, id, cached };
+    } catch (e) { out = { ok: false, error: e.message }; }
+    const body = JSON.stringify(out);
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+    return rs.end(body);
+  }
+  if (u.pathname === '/api/settings') {
+    if (rq.method === 'POST') {
+      let raw = '';
+      await new Promise((ok) => {
+        rq.on('data', (c) => { raw += c; if (raw.length > 8192) { try { rq.destroy(); } catch (e) { } } });
+        rq.on('end', ok); rq.on('error', ok);
+      });
+      let patch = {};
+      try { patch = JSON.parse(raw || '{}') || {}; } catch (e) { }
+      const st = saveSettings({ trialDetect: !!patch.trialDetect });
+      log('设置已更新：识别试听片段 = ' + (st.trialDetect ? '开' : '关'));
+    }
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return rs.end(JSON.stringify({ ok: true, settings: loadSettings() }));
+  }
   if (u.pathname === '/api/status') {
     const body = JSON.stringify({
       ok: true, port: PORT, host: HOST, user: USER, pass: SECRET,
@@ -2354,6 +2702,7 @@ const server = http.createServer(async (rq, rs) => {
       sessionHint: COOKIE ? (sessHint || (COOKIE.length + ' 字符')) : '',
       catalog: { tracks: CATALOG.tracks.size, albums: CATALOG.albums.size, artists: CATALOG.artists.size, playlists: CATALOG.playlists.length },
       loadedAt: CATALOG.loadedAt || 0,
+      settings: loadSettings(),
       log: LOG_RING.slice(-120),
     });
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -2421,6 +2770,15 @@ async function start(opts = {}) {
     HOST = '127.0.0.1';
     PORT = 4533;
     SECRET = '';
+  }
+  /**
+   * 局域网模式：允许**手机**连进来（椒盐改包 / 其它 Subsonic 客户端）。
+   * 必须是显式开关（独立运行 SODA_LAN=1，或宿主传 opts.lan），不走环境变量猜；
+   * 鉴权仍靠 auth.json 的随机密钥，控制面 /api/* 仍要启动令牌。
+   */
+  if (opts.lan || (!opts.embedded && process.env.SODA_LAN === '1')) {
+    HOST = '0.0.0.0';
+    LAN_MODE = true;
   }
   sweepTempCookies();
   // 路径：优先用宿主给的 getter（Folium 1.5+）；否则退回 opts.dataDir（独立运行 / 旧宿主）
