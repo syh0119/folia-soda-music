@@ -155,6 +155,16 @@ export default function activate(folium) {
         description: { 'zh-CN': '用汽水原生 KRC，逐字点亮', en: 'Use native KRC' },
       },
       {
+        key: 'trialDetect', type: 'boolean',
+        label: { 'zh-CN': '识别试听片段（VIP 到期时 30~60 秒档）', en: 'Detect preview-only tracks' },
+        defaultValue: false,
+        group: { 'zh-CN': '播放', en: 'Playback' },
+        description: {
+          'zh-CN': '开启后：取流时比对容器真实时长与文件体积，命中就在歌名后加「（试听）」，并在续播里跳过这些歌；整批都是试听时仍会兜底放行，避免续播中断。关闭则完全不做判定。只影响本机播放体验，不改变音源与账号权益。',
+          en: 'When on, marks and skips 30-60s preview tracks in playlists and auto-continue.',
+        },
+      },
+      {
         key: 'vsync', type: 'boolean',
         label: { 'zh-CN': '垂直同步（跟随显示器刷新率）', en: 'V-Sync (follow display)' },
         defaultValue: true,
@@ -220,6 +230,34 @@ export default function activate(folium) {
   const apiFetch = (path, init) => folium.net.fetch(base() + path, Object.assign({}, init || {}, {
     headers: Object.assign({}, (init && init.headers) || {}, (CONN.token && isLoopback(base())) ? { 'x-soda-token': CONN.token } : {}),
   }));
+
+  /**
+   * 「识别试听片段」是宿主侧设置，需同步给内建服务（服务端另有 settings.json）。
+   * 不依赖服务端读宿主配置：启动时对齐一次，之后每次改动都推。
+   */
+  const pushTrial = () => {
+    const v = !!(section.params.get() || {}).trialDetect;
+    return apiFetch('/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ trialDetect: v }),
+    }).catch(() => { });
+  };
+  section.params.subscribe(() => { pushTrial(); });
+  // 服务刚起时可能还没 listen：退避重试 8 次
+  (async () => {
+    for (let i = 0; i < 8; i++) {
+      const v = !!(section.params.get() || {}).trialDetect;
+      try {
+        await apiFetch('/api/settings', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ trialDetect: v }),
+        });
+        return;
+      } catch (e) { await new Promise((r) => setTimeout(r, 3000)); }
+    }
+  })();
 
   /** 调 Subsonic 接口；net.fetch 的 json() 是同步方法，不要 await */
   async function call(ep, params) {
