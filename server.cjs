@@ -763,14 +763,60 @@ async function trackV2Raw(trackId) {
   const tr = j.track, tp = j.track_player;
   if (!tr) throw new Error('track_v2 无 track');
   let items = [];
+  let videoId = '';
   if (tp && tp.video_model) {
     const vm = JSON.parse(tp.video_model);
+    videoId = String(vm.video_id || '');
     items = vm.video_list.map(v => ({ quality: v.video_meta.quality, main_url: v.main_url, spade_a: v.encrypt_info ? v.encrypt_info.spade_a : null }));
   } else if (tp && tp.url_player_info) {
     const gi = await reqJson(tp.url_player_info);
     items = gi.Result.Data.PlayInfoList.map(p => ({ quality: p.Quality, main_url: p.MainPlayUrl, spade_a: p.PlayAuth }));
   }
-  return { track: tr, lyric: (j.lyric || {}).content || '', translations: (j.lyric || {}).translations || null, items };
+  return {
+    track: tr, lyric: (j.lyric || {}).content || '', translations: (j.lyric || {}).translations || null,
+    items, videoId,
+    // 降级信息：服务端是否只给了「试听 vid」
+    audition: detectAudition(tr, videoId),
+    vip: vipOf(tr),
+  };
+}
+
+/**
+ * 判定这次 track_v2 是不是「服务端降级成了试听档」。
+ *
+ * 背景（实测 2026-10-24）：汽水 PC 链路在**登录态失效 / 被降级成游客**时，
+ * 不会报错，而是安静地把 `video_id` 换成 `track.preview.vid`（试听 vid），
+ * 于是 `video_list` 里每个档位的 URL 都指向 30~60 秒的试听片段。
+ * 用户表现为「明明是 VIP，插到 Folia 里却全是试听」。
+ *
+ * 判据（服务端字段，两个互相独立）：
+ *   · `track.audition_info.vid` / `track.preview.vid` —— 试听用的那个 vid
+ *   · `track_player.video_model.video_id`             —— 这次实际下发的 vid
+ * 两者相等 = 服务端只给了试听片段。
+ * 另外 `track.audition_info.duration_ms` 直接给出试听片段的毫秒数（30001 / 60000 …）。
+ */
+function detectAudition(tr, videoId) {
+  const prevVid = tr && tr.preview && tr.preview.vid ? String(tr.preview.vid) : '';
+  const audVid = tr && tr.audition_info && tr.audition_info.vid ? String(tr.audition_info.vid) : '';
+  const audMs = tr && tr.audition_info && tr.audition_info.duration_ms ? Number(tr.audition_info.duration_ms) : 0;
+  const previewMs = tr && tr.preview && tr.preview.duration ? Number(tr.preview.duration) : 0;
+  const auditionVid = audVid || prevVid;
+  const isAudition = !!auditionVid && !!videoId && auditionVid === videoId;
+  return {
+    isAudition,
+    auditionVid,
+    videoId: String(videoId || ''),
+    durationMs: audMs || previewMs || 0,
+    startTimeMs: tr && tr.audition_info && tr.audition_info.start_time_ms ? Number(tr.audition_info.start_time_ms) : 0,
+  };
+}
+
+/** 从 track.check_context 里取会员等级（'svip' / 'vip' / undefined）。 */
+function vipOf(tr) {
+  try {
+    const cc = tr && tr.check_context ? JSON.parse(tr.check_context) : null;
+    return (cc && cc.vip) ? String(cc.vip) : '';
+  } catch (e) { return ''; }
 }
 
 /**
@@ -849,7 +895,6 @@ function trackV2(trackId) {
   if (TV2_MEMO.size > 500) TV2_MEMO.delete(TV2_MEMO.keys().next().value);
   return p;
 }
-
 function pickItem(items) {
   if (!items || !items.length) throw new Error('无可用流');
   if (QUALITY === 'best') {
@@ -942,21 +987,127 @@ function audioDurationMs(buf) {
   return mp4DurationMs(buf);
 }
 
+/**
+ * 只读文件头就拿时长（秒）。FLAC 的 STREAMINFO 在头部 42 字节内，
+ * MP4 的 mvhd 通常在 moov 里 —— moov 在文件头（faststart）就能读到，
+ * 在文件尾（普通 m4a）就得全量读一遍。
+ *
+ * 为什么值得单独写一个：cachedIsStaleClip 每次都要看缓存时长，
+ * 全量 readFileSync 一首无损曲是 25~60MB 的磁盘读（实测 5.5ms/次），
+ * 而缓存命中的路径是**每次播放都走**的。这里先读 256KB 头，
+ * 认不出来再全量回退 —— 常见的 FLAC / faststart MP4 都不再全量读。
+ */
+function probeDurationMs(file) {
+  let fd = null;
+  try {
+    const head = Buffer.alloc(262144);
+    fd = fs.openSync(file, 'r');
+    const n = fs.readSync(fd, head, 0, head.length, 0);
+    const b = head.subarray(0, n);
+    if (b.toString('latin1', 0, 4) === 'fLaC') {
+      const d = flacDurationMs(b);
+      if (d) return d;
+    } else {
+      const d = mp4DurationMs(b);
+      if (d) return d;
+    }
+  } catch (e) {
+    // 读头失败 → 落到下面全量读
+  } finally {
+    try { if (fd !== null) fs.closeSync(fd); } catch (e) { }
+  }
+  try { return audioDurationMs(fs.readFileSync(file)); } catch (e) { return 0; }
+}
+
 /** 取流 + 解密 + 落盘缓存 */
 const AUDIO_INFLIGHT = new Map();        // id -> promise：同一个 id 的并发请求只做一次下载/解密
+
+/**
+ * 缓存命中前的「片段校验」。
+ *
+ * 为什么必须做（实测 2026-10-24）：登录态失效期间取到的 30 秒试听片段被写进了缓存。
+ * 后来登录态恢复了，缓存还在 —— 模组永远命中这个坏缓存，用户就一直听试听。
+ * 缓存本身没有任何「当时是不是降级状态」的标记，所以只能靠**重新问一次服务端**来判断：
+ *   · 服务端现在给正片 vid  → 这个旧缓存一定是降级期留下的，丢掉重取
+ *   · 服务端现在也给试听 vid → 缓存是对的，留着
+ *
+ * 代价：多一次 track_v2（~250ms）。用「文件真实时长 < 官方时长的 70%」作为触发条件，
+ * 只有可疑的缓存才去查 —— 完整缓存零开销。
+ *
+ * ⚠️ 这里必须用 trackV2Raw（**绕过 60 秒 memo**），不能用 trackV2：
+ *    memo 里缓存的可能是降级期那次请求的结果（video_id = 试听 vid）。
+ *    登录态已经恢复、但 memo 还没过期时，用 memo 会把「降级」当成「现在仍然是降级」，
+ *    于是判定「缓存没错」→ 坏缓存被永久保留 → 用户一直听试听。
+ *    这正是本次要修的病根，不能在这里再引入同一个坑。
+ */
+async function cachedIsStaleClip(trackId, hit) {
+  try {
+    const declared = Number(hit.duration || 0);
+    if (!declared) return false;
+    const audioFile = path.join(cacheDir(), hit.file);
+    const real = probeDurationMs(audioFile);
+    if (!real || real >= declared * 0.7) return false;          // 完整缓存，直接放行
+    // 可疑：绕过 memo 直接问服务端现在给的是正片还是试听
+    const { audition, vip } = await trackV2Raw(trackId);
+    if (audition && audition.isAudition) return false;           // 服务端也给试听 → 缓存没错
+    log('缓存是降级期的试听片段（' + (real / 1000).toFixed(0) + 's / 官方 ' + (declared / 1000).toFixed(0)
+      + 's），但服务端现在给正片（VIP=' + (vip || '无') + '）—— 丢弃缓存重取');
+    try { fs.rmSync(audioFile, { force: true }); } catch (e) { }
+    try { fs.rmSync(path.join(cacheDir(), trackId + '.json'), { force: true }); } catch (e) { }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function ensureAudio(trackId) {
   trackId = safeTrackId(trackId);
   const metaFile = path.join(cacheDir(), trackId + '.json');
   const hit = fs.existsSync(metaFile) ? JSON.parse(fs.readFileSync(metaFile, 'utf8')) : null;
-  if (hit && fs.existsSync(path.join(cacheDir(), hit.file))) return hit;
+  if (hit && fs.existsSync(path.join(cacheDir(), hit.file))) {
+    if (!(await cachedIsStaleClip(trackId, hit))) return hit;
+    // 缓存被判定为陈旧 → 落到下面重新取流
+  }
 
   // 单飞：宿主取流 / 预取 / 歌词兜底可能同时要同一首，重复下载既慢又浪费带宽
   const pending = AUDIO_INFLIGHT.get(trackId);
   if (pending) return pending;
   const job = (async () => {
     const t0 = Date.now();
-    const { track, lyric, translations, items } = await trackV2(trackId);
+    // 用 trackV2Raw（绕过 60 秒 memo）：取流要判定「服务端现在是不是还在降级」，
+    // 必须看实时状态。用 memo 可能拿到降级期的旧结果（video_id = 试听 vid），
+    // 于是误判成「服务端只给试听」，白白触发一次登录态重同步。
+    let { track, lyric, translations, items, audition, vip } = await trackV2Raw(trackId);
     const t1 = Date.now();
+
+    /**
+     * 降级自愈：服务端只给了试听 vid —— 典型是登录态过期被降级成游客。
+     * 这时重新同步一次登录态再试；同步成功还拿不到正片，才认作「真试听」。
+     */
+    if (audition && audition.isAudition) {
+      if (!vip) {
+        log('⚠ 服务端只给了试听片段（无会员标记）—— 疑似登录态过期，先重新同步 …');
+        try {
+          await tryResync('服务端下发试听 vid');
+          TV2_MEMO.delete(String(trackId));
+          const again = await trackV2Raw(trackId);
+          if (!again.audition.isAudition) {
+            log('✓ 重新同步后拿到完整版（VIP=' + (again.vip || '?') + '），继续');
+            track = again.track; lyric = again.lyric; translations = again.translations;
+            items = again.items; audition = again.audition; vip = again.vip;
+          } else {
+            log('✗ 重新同步后仍是试听档（VIP=' + (again.vip || '无') + '）—— 账号本身没有该曲的完整版权');
+            track = again.track; lyric = again.lyric; translations = again.translations;
+            items = again.items; audition = again.audition; vip = again.vip;
+          }
+        } catch (e) {
+          log('重新同步失败: ' + e.message);
+        }
+      } else {
+        log('服务端只给了试听片段（VIP=' + vip + '）—— 该曲对当前账号只有试听版权');
+      }
+    }
+
     const pick = pickItem(items);
     const kr = await hostCall('decodeSpade', { spade: pick.spade_a });
     const t2 = Date.now();
@@ -974,9 +1125,17 @@ async function ensureAudio(trackId) {
       lyric, coverBuf,
     });
     const fname = trackId + r.ext;
-    // 试听判定（开关开启时才做）：真实时长 < min(90s, 官方 60%)，或体积 < 按码率推算的一半
+    /**
+     * 试听判定（开关开启时才做）：真实时长 < min(90s, 官方 60%)，或体积 < 按码率推算的一半。
+     * 服务端明确给了试听 vid 的 —— 无论开关开不开都算试听（那是服务端真的只给了片段）。
+     */
     let trial = false;
-    if (trialEnabled()) {
+    if (audition && audition.isAudition) {
+      trial = true;
+      log('服务端只下发试听 vid（' + (audition.durationMs ? (audition.durationMs / 1000).toFixed(0) + 's' : '?')
+        + '）—— 试听片段：' + track.name);
+    }
+    if (!trial && trialEnabled()) {
       try {
         const declared = Number(track.duration || 0);
         const real = audioDurationMs(r.data);
@@ -1001,6 +1160,8 @@ async function ensureAudio(trackId) {
       cover: rawCoverOf(track), lyric,
       translations: translations || null,
       duration: track.duration || 0,
+      vip: vip || '',                                  // 取流时的会员等级，便于事后排查
+      audition: audition ? audition.isAudition : false, // 服务端当时是否只给了试听
     };
     fs.writeFileSync(metaFile, JSON.stringify(meta));
     log('取流完成 ' + meta.name + ' [' + meta.quality + '] ' + (r.data.length / 1048576).toFixed(1) + 'MB');
@@ -1914,7 +2075,12 @@ async function tryStreamFlac(id, res) {
   if (fs.existsSync(metaFile)) return false;                      // 命中缓存：走原来的文件服务
 
   const t0 = Date.now();
-  const { track, lyric, translations, items } = await trackV2(id);
+  // 这里必须用 trackV2Raw（绕过 60 秒 memo）：分块流是「正片」的快路径，
+  // 判断「服务端现在是不是还在降级成试听」必须看实时状态，
+  // 不能用可能还存着降级期结果的 memo。
+  const { track, lyric, translations, items, audition, vip } = await trackV2Raw(id);
+  // 服务端只给了试听 vid → 别走分块流（那是完整版的路），回退到 ensureAudio 走降级自愈
+  if (audition && audition.isAudition) return false;
   const pick = pickItem(items);
   if (!pick || !/^(lossless|hi_res)$/.test(String(pick.quality))) return false;
 
@@ -2020,6 +2186,11 @@ async function tryStreamFlac(id, res) {
     translations: translations || null,
     duration: track.duration || 0,
     streamed: true,                       // 分块写出来的：标签只有文本，没有封面
+    // 降级标记：分块流只在「服务端给正片」时才走，所以这里必然不是试听；
+    // 但仍然写清楚，避免以后排查时看到 undefined 猜不出是「没记录」还是「没检测」。
+    trial: false,
+    vip: vip || '',
+    audition: false,
   };
   fs.writeFileSync(metaFile, JSON.stringify(meta));
   sweepCache();
@@ -2707,6 +2878,33 @@ const server = http.createServer(async (rq, rs) => {
     });
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return rs.end(body);
+  }
+  /**
+   * 登录态体检：一次性告诉用户「服务端认不认你是 VIP、会不会给你正片」。
+   *
+   * 背景：汽水在登录态失效时会**静默降级**成游客 —— 不报错、不掉登录，
+   * 只是把每首歌的流换成 30~60 秒试听。用户完全看不出是登录态问题。
+   * 这个接口把两件事分开报告：
+   *   vip        —— 服务端认出的会员等级（空 = 当游客）
+   *   audition   —— 抽样几首，服务端这次给的是试听 vid 还是正片 vid
+   */
+  if (u.pathname === '/api/vipcheck') {
+    let out = { ok: false, sampled: 0, audition: 0, full: 0, vip: '', samples: [] };
+    try {
+      await waitReady(30000);
+      const ids = [...CATALOG.tracks.keys()].slice(0, 6);
+      for (const id of ids) {
+        const r = await trackV2Raw(id);
+        out.sampled++;
+        if (r.audition && r.audition.isAudition) out.audition++; else out.full++;
+        if (!out.vip && r.vip) out.vip = r.vip;
+        out.samples.push({ id: String(id), name: r.track.name, audition: !!(r.audition && r.audition.isAudition), vip: r.vip || '' });
+      }
+      out.ok = true;
+      out.session = COOKIE ? (COOKIE.length + ' 字符') : '未登录';
+    } catch (e) { out.error = (e && e.message) || String(e); }
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    return rs.end(JSON.stringify(out));
   }
   if (u.pathname === '/api/refresh_session') {
     log('手动触发：从本机客户端同步登录态 …');
